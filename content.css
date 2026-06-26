@@ -1,0 +1,31 @@
+#meet-rec-btn {
+  position: fixed;
+  left: 50%;
+  bottom: 92px;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  padding: 10px 18px;
+  border: none;
+  border-radius: 24px;
+  background: #d93025;
+  color: #fff;
+  font: 600 14px/1 "Google Sans", Roboto, system-ui, sans-serif;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  opacity: 0.95;
+  transition: opacity 0.15s ease;
+}
+
+#meet-rec-btn:hover {
+  opacity: 1;
+}
+
+#meet-rec-btn.recording {
+  background: #202124;
+  animation: meet-rec-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes meet-rec-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(217, 48, 37, 0.6); }
+  50% { box-shadow: 0 0 0 8px rgba(217, 48, 37, 0); }
+}

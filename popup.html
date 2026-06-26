@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        font-family: "Google Sans", Roboto, system-ui, sans-serif;
+        width: 260px;
+        margin: 0;
+        padding: 14px;
+        color: #202124;
+      }
+      h1 { font-size: 14px; margin: 0 0 10px; }
+      #status {
+        font-size: 13px;
+        margin: 0 0 12px;
+        color: #5f6368;
+        min-height: 18px;
+      }
+      button {
+        width: 100%;
+        padding: 9px;
+        border: 0;
+        border-radius: 6px;
+        font-size: 14px;
+        cursor: pointer;
+      }
+      #stop { background: #d93025; color: #fff; }
+      #stop:disabled { background: #e8eaed; color: #9aa0a6; cursor: default; }
+      #savekey { background: #1a73e8; color: #fff; }
+      .hint { font-size: 12px; color: #80868b; margin: 10px 0 0; }
+      hr { border: 0; border-top: 1px solid #eceff1; margin: 14px 0 10px; }
+      .ghdr { display: block; font-size: 13px; font-weight: 500; margin: 0 0 6px; }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px;
+        border: 1px solid #dadce0;
+        border-radius: 6px;
+        font-size: 13px;
+        margin: 0 0 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Запис Meet → Drive</h1>
+    <p id="status">—</p>
+    <button id="stop" disabled>■ Зупинити запис</button>
+    <p class="hint">Старт — кнопкою «● Запис» у вікні Meet.</p>
+
+    <hr />
+    <label class="ghdr" for="gkey">Gemini API-ключ (авто-конспект)</label>
+    <input id="gkey" type="password" placeholder="Вставте ключ і натисніть «Зберегти»" autocomplete="off" />
+    <button id="savekey">Зберегти ключ</button>
+    <p id="keystate" class="hint"></p>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
