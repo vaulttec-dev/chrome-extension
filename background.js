@@ -148,8 +148,11 @@ async function withFreshToken(fn) {
   }
 }
 
-async function getFolderId(token) {
-  const q = "mimeType='application/vnd.google-apps.folder' and name='Запис зустрічей' and trashed=false";
+// Знайти або створити теку з назвою name всередині parentId (або в корені My Drive).
+async function getOrCreateFolder(token, name, parentId) {
+  const safe = name.replace(/'/g, "\\'");
+  let q = `mimeType='application/vnd.google-apps.folder' and name='${safe}' and trashed=false`;
+  if (parentId) q += ` and '${parentId}' in parents`;
   const r = await fetch(
     `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id)`,
     { headers: { Authorization: `Bearer ${token}` } }
@@ -158,15 +161,26 @@ async function getFolderId(token) {
   const d = await r.json();
   let id = d.files && d.files[0] && d.files[0].id;
   if (!id) {
+    const body = { name, mimeType: 'application/vnd.google-apps.folder' };
+    if (parentId) body.parents = [parentId];
     const c = await fetch('https://www.googleapis.com/drive/v3/files', {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Запис зустрічей', mimeType: 'application/vnd.google-apps.folder' })
+      body: JSON.stringify(body)
     });
     if (!c.ok) throw httpError('folder create', c.status);
     id = (await c.json()).id;
   }
   return id;
+}
+
+// Тека конкретної зустрічі: «Запис зустрічей» / «РРРР-ММ-ДД» / «Meet <код> <дата> <час>».
+// Відео й конспект однієї зустрічі лягають сюди разом.
+async function getMeetingFolderId(token, baseName) {
+  const root = await getOrCreateFolder(token, 'Запис зустрічей', null);
+  const day = (baseName.match(/\d{4}-\d{2}-\d{2}/) || [])[0];
+  const parent = day ? await getOrCreateFolder(token, day, root) : root;
+  return getOrCreateFolder(token, baseName, parent);
 }
 
 async function uploadToDrive(dataUrl, name) {
@@ -175,7 +189,7 @@ async function uploadToDrive(dataUrl, name) {
 }
 
 async function uploadWithToken(token, blob, name) {
-  const folderId = await getFolderId(token);
+  const folderId = await getMeetingFolderId(token, name.replace(/\.webm$/i, ''));
 
   const init = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
     method: 'POST',
@@ -319,7 +333,7 @@ async function processWithGemini(dataUrl, name) {
 
     try {
       await withFreshToken(async (token) => {
-        const folderId = await getFolderId(token);
+        const folderId = await getMeetingFolderId(token, name.replace(/\.webm$/i, ''));
         await createDriveDoc(token, folderId, docName, text);
       });
       setStatus('Конспект готовий ✓ — у теці «Запис зустрічей»');
