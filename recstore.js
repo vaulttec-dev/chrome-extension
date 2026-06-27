@@ -4,7 +4,9 @@
 // файлом. Підключається в content_scripts перед content.js → globalThis.RecStore.
 (function (g) {
   const DB_NAME = 'meetrec';
-  const DB_VERSION = 1;
+  // v2 додає складений індекс 'rid_kind' → дешевий count() відео-шматків без читання Blob.
+  // Міграція лише додає індекс; наявні сесії (без поля kind) зберігаються.
+  const DB_VERSION = 2;
   let dbPromise = null;
 
   function openDb() {
@@ -16,10 +18,16 @@
         if (!db.objectStoreNames.contains('recordings')) {
           db.createObjectStore('recordings', { keyPath: 'id' });
         }
+        let chunks;
         if (!db.objectStoreNames.contains('chunks')) {
           // autoIncrement → монотонний порядок вставки; індекс 'rid' групує шматки сесії.
-          const cs = db.createObjectStore('chunks', { keyPath: 'seq', autoIncrement: true });
-          cs.createIndex('rid', 'rid', { unique: false });
+          chunks = db.createObjectStore('chunks', { keyPath: 'seq', autoIncrement: true });
+          chunks.createIndex('rid', 'rid', { unique: false });
+        } else {
+          chunks = req.transaction.objectStore('chunks');
+        }
+        if (!chunks.indexNames.contains('rid_kind')) {
+          chunks.createIndex('rid_kind', ['rid', 'kind'], { unique: false });
         }
       };
       req.onsuccess = () => resolve(req.result);
@@ -56,24 +64,28 @@
     return meta.id;
   }
 
-  // Дописати шматок відео сесії id (на диск).
-  async function appendChunk(id, blob) {
+  // Дописати шматок доріжки сесії id (на диск). kind: 'video' (типово) або 'audio'.
+  async function appendChunk(id, blob, kind = 'video') {
     await tx('chunks', 'readwrite', (t) => {
-      t.objectStore('chunks').add({ rid: id, blob });
+      t.objectStore('chunks').add({ rid: id, kind, blob });
     });
   }
 
-  // Зібрати всі шматки сесії в один Blob (за порядком вставки).
-  async function readBlob(id, mime) {
+  // Зібрати всі шматки однієї доріжки сесії в один Blob (за порядком вставки).
+  // Старі записи без поля kind трактуємо як 'video'.
+  async function readBlob(id, mime, kind = 'video') {
     const parts = await tx('chunks', 'readonly', (t) =>
       reqDone(t.objectStore('chunks').index('rid').getAll(IDBKeyRange.only(id))));
-    return new Blob((parts || []).map((p) => p.blob), { type: mime || 'video/webm' });
+    const wanted = (parts || []).filter((p) => (p.kind || 'video') === kind);
+    return new Blob(wanted.map((p) => p.blob), { type: mime || 'video/webm' });
   }
 
-  // Кількість шматків сесії (≈ секунди запису при recorder.start(1000)) — дешево, без читання Blob.
+  // Кількість відео-шматків сесії (≈ секунди запису при recorder.start(1000)) — дешево, без читання Blob.
+  // Складеним індексом рахуємо лише доріжку 'video', щоб паралельні аудіо-шматки не подвоювали тривалість.
+  // Старі сесії (kind=undefined) у складений індекс не потрапляють → 0 (банер просто без тривалості).
   async function countChunks(id) {
     return tx('chunks', 'readonly', (t) =>
-      reqDone(t.objectStore('chunks').index('rid').count(IDBKeyRange.only(id))));
+      reqDone(t.objectStore('chunks').index('rid_kind').count(IDBKeyRange.only([id, 'video']))));
   }
 
   // Усі незавершені сесії (видалені = вже збережені), найновіші першими.

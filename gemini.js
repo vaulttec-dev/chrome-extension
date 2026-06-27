@@ -5,9 +5,8 @@
 (function (g) {
   const GEMINI_MODEL = 'gemini-2.5-flash';
   const GEMINI_PROMPT = `Ти — досвідчений асистент із протоколювання робочих зустрічей.
-Тобі дано ЗАПИС зустрічі Google Meet. Спирайся ВИКЛЮЧНО на те, що РЕАЛЬНО СКАЗАНО вголос
-(аудіо), а не на те, що видно на екрані. Уважно «прослухай» увесь запис від початку до кінця
-і не пропусти жодної важливої деталі.
+Тобі дано АУДІОЗАПИС зустрічі Google Meet. Спирайся ВИКЛЮЧНО на те, що РЕАЛЬНО СКАЗАНО вголос,
+уважно «прослухай» увесь запис від початку до кінця і не пропусти жодної важливої деталі.
 
 Спершу подумки зроби ПОВНУ розшифровку всього мовлення, а потім на її основі склади
 ДЕТАЛЬНИЙ конспект УКРАЇНСЬКОЮ у форматі Markdown:
@@ -33,8 +32,9 @@
 Якщо в записі реально немає мовлення або воно нерозбірливе — прямо так і напиши. Пиши
 українською, конкретно; нічого важливого не вигадуй і не пропускай.`;
 
-  // Залити відео у Gemini Files API (resumable) → { name, uri, state, mimeType }.
-  async function geminiUploadFile(blob, key) {
+  // Залити медіа у Gemini Files API (resumable) → { name, uri, state, mimeType }.
+  // mimeType: 'audio/webm' для аудіо-доріжки (типово) або 'video/webm' для повного відео.
+  async function geminiUploadFile(blob, key, mimeType = 'video/webm') {
     const start = await fetch('https://generativelanguage.googleapis.com/upload/v1beta/files', {
       method: 'POST',
       headers: {
@@ -42,7 +42,7 @@
         'X-Goog-Upload-Protocol': 'resumable',
         'X-Goog-Upload-Command': 'start',
         'X-Goog-Upload-Header-Content-Length': String(blob.size),
-        'X-Goog-Upload-Header-Content-Type': 'video/webm',
+        'X-Goog-Upload-Header-Content-Type': mimeType,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({ file: { display_name: 'meet-recording' } })

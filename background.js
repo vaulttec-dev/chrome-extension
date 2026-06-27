@@ -4,7 +4,7 @@
 importScripts('gdrive.js', 'gemini.js');
 
 const GEMINI_ALARM = 'geminiPoll';
-const GEMINI_MAX_TICKS = 12; // ~6 хв при періоді 0.5 хв
+const GEMINI_MAX_TICKS = 60; // ~30 хв при періоді 0.5 хв — багатогодинне аудіо довго в стані PROCESSING
 
 function setStatus(text) { chrome.storage.local.set({ lastStatus: text }); }
 

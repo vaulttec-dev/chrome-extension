@@ -10,6 +10,9 @@
   let isRecording = false;
   let recorder = null;
   let chunks = [];        // запасний шлях у пам'яті, якщо журнал IndexedDB недоступний
+  let audioRecorder = null;   // окрема аудіо-доріжка для Gemini (відео для конспекту завелике)
+  let audioChunks = [];       // запасний шлях у пам'яті для аудіо
+  let audioStopPromise = null; // резолвиться, коли audioRecorder завершив і скинув останній шматок
   let audioCtx = null;
   let streams = [];
   let capturedCode = null; // код зустрічі, зафіксований на старті (URL може змінитися на стопі)
@@ -138,12 +141,28 @@
 
       recorder.ondataavailable = (e) => {
         if (!e.data || !e.data.size) return;
-        if (recId) RecStore.appendChunk(recId, e.data).catch((err) => console.warn('[MeetRec] appendChunk:', err));
+        if (recId) RecStore.appendChunk(recId, e.data, 'video').catch((err) => console.warn('[MeetRec] appendChunk:', err));
         else chunks.push(e.data);
       };
       recorder.onstop = onRecorderStop;
+
+      // Паралельно пишемо лише змікшований звук (вкладка + мікрофон) окремою доріжкою.
+      // У Gemini шлемо саме її: відео 720p за кілька годин — це ГБ і мільйони токенів,
+      // тоді як opus-аудіо влазить і в ліміт файлу (2 ГБ), і в контекст моделі.
+      audioChunks = [];
+      const audioMime = ['audio/webm;codecs=opus', 'audio/webm']
+        .find((t) => MediaRecorder.isTypeSupported(t)) || 'audio/webm';
+      audioRecorder = new MediaRecorder(dest.stream, { mimeType: audioMime });
+      audioStopPromise = new Promise((resolve) => { audioRecorder.onstop = resolve; });
+      audioRecorder.ondataavailable = (e) => {
+        if (!e.data || !e.data.size) return;
+        if (recId) RecStore.appendChunk(recId, e.data, 'audio').catch((err) => console.warn('[MeetRec] appendChunk audio:', err));
+        else audioChunks.push(e.data);
+      };
+
       display.getVideoTracks()[0].addEventListener('ended', stopCapture);
       recorder.start(1000);
+      audioRecorder.start(1000);
 
       isRecording = true;
       render();
@@ -163,6 +182,7 @@
   function stopCapture() {
     if (recorder && recorder.state !== 'inactive') {
       setStatus('Зупинка та збереження…');
+      if (audioRecorder && audioRecorder.state !== 'inactive') audioRecorder.stop();
       recorder.stop();
     }
   }
@@ -173,6 +193,11 @@
     // Транзакції IndexedDB на 'chunks' серіалізовані за порядком створення, тож readBlob
     // (створена після appendChunk останнього шматка) гарантовано бачить увесь запис.
     const blob = id ? await RecStore.readBlob(id, 'video/webm') : new Blob(chunks, { type: 'video/webm' });
+    // Дочекатися, поки аудіо-рекордер скине останній шматок, і зібрати аудіо-доріжку для Gemini.
+    if (audioStopPromise) await audioStopPromise;
+    const audioBlob = id
+      ? await RecStore.readBlob(id, 'audio/webm', 'audio')
+      : new Blob(audioChunks, { type: 'audio/webm' });
     cleanupStreams();
     isRecording = false;
     render();
@@ -185,13 +210,16 @@
         ? 'Готово ✓ — збережено в Google Drive'
         : 'Готово ✓ — збережено локально (тека «Завантаження»)');
       if (id) await RecStore.deleteSession(id); // відео в безпеці → журнал більше не потрібен
-      await maybeGemini(blob, name, saved.folderId); // ставить власні статуси
+      await maybeGemini(audioBlob, name, saved.folderId); // ставить власні статуси
     } catch (e) {
       // Сесію НЕ видаляємо → запис відновиться при наступному відкритті Meet.
       setStatus('Помилка збереження: ' + ((e && e.message) || e));
     } finally {
       recorder = null;
       chunks = [];
+      audioRecorder = null;
+      audioChunks = [];
+      audioStopPromise = null;
       recId = null;
     }
   }
@@ -220,15 +248,16 @@
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
-  // Якщо є Gemini-ключ — заливаємо відео в Gemini (великий аплоад тут), далі
+  // Якщо є Gemini-ключ — заливаємо АУДІО в Gemini (великий аплоад тут), далі
   // дрібну обробку (очікування → генерація → Google Doc) веде service worker.
-  async function maybeGemini(blob, name, folderId) {
+  async function maybeGemini(audioBlob, name, folderId) {
     const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
     if (!geminiApiKey) return;
+    if (!audioBlob || !audioBlob.size) { setStatus('Конспект пропущено: немає аудіо у записі'); return; }
     const baseName = name.replace(/\.webm$/i, '');
     try {
-      setStatus('Готую конспект (надсилаю відео в Gemini)…');
-      const file = await Gemini.geminiUploadFile(blob, geminiApiKey);
+      setStatus('Готую конспект (надсилаю аудіо в Gemini)…');
+      const file = await Gemini.geminiUploadFile(audioBlob, geminiApiKey, 'audio/webm');
       await sendBg({
         type: 'GEMINI_CONTINUE',
         job: {
@@ -309,8 +338,10 @@
         setStatus(saved.where === 'drive'
           ? 'Відновлено ✓ — збережено в Google Drive'
           : 'Відновлено ✓ — збережено локально');
+        // Аудіо-доріжку з журналу шлемо в Gemini; якщо її нема (старі сесії) — фолбек на відео.
+        const audioBlob = await RecStore.readBlob(session.id, 'audio/webm', 'audio').catch(() => null);
         await RecStore.deleteSession(session.id);
-        await maybeGemini(blob, name, saved.folderId);
+        await maybeGemini(audioBlob && audioBlob.size ? audioBlob : blob, name, saved.folderId);
       } else {
         downloadLocally(blob, name);
         setStatus('Відновлено ✓ — файл завантажується');
@@ -332,6 +363,9 @@
     cleanupStreams();
     recorder = null;
     chunks = [];
+    audioRecorder = null;
+    audioChunks = [];
+    audioStopPromise = null;
     recId = null;
     isRecording = false;
     render();
