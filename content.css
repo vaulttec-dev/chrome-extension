@@ -29,3 +29,42 @@
   0%, 100% { box-shadow: 0 0 0 0 rgba(217, 48, 37, 0.6); }
   50% { box-shadow: 0 0 0 8px rgba(217, 48, 37, 0); }
 }
+
+/* Банер відновлення урваного запису */
+#meet-rec-recovery {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 8px 14px;
+  border-radius: 12px;
+  background: #202124;
+  color: #fff;
+  font: 500 13px/1.2 "Google Sans", Roboto, system-ui, sans-serif;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+#meet-rec-recovery .mrr-text { margin-right: 4px; }
+
+#meet-rec-recovery button {
+  border: none;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font: 600 12px/1 "Google Sans", Roboto, system-ui, sans-serif;
+  cursor: pointer;
+  background: #1a73e8;
+  color: #fff;
+}
+
+#meet-rec-recovery button:last-child {
+  background: transparent;
+  color: #9aa0a6;
+  padding: 6px 8px;
+  font-size: 14px;
+}
+
+#meet-rec-recovery button:hover { opacity: 0.92; }
