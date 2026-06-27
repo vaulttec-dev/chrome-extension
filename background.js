@@ -169,7 +169,7 @@ async function saveDoc(job, text) {
       const folderId = job.folderId || await GDrive.getMeetingFolderId(token, job.meetingBaseName);
       await GDrive.createDriveDoc(token, folderId, job.docName, text);
     });
-    return 'Конспект готовий ✓ — у теці «Запис зустрічей»';
+    return 'Конспект готовий ✓ — у теці «Meeting Recordings»';
   } catch (docErr) {
     console.warn('[MeetRec] Doc у Drive не вдалося, зберігаю локально:', docErr);
     await download('data:text/plain;charset=utf-8,' + encodeURIComponent(text), job.docName + '.txt');

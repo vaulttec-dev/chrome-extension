@@ -36,10 +36,10 @@
     return id;
   }
 
-  // Тека конкретної зустрічі: «Запис зустрічей» / «РРРР-ММ-ДД» / baseName.
+  // Тека конкретної зустрічі: «Meeting Recordings» / «РРРР-ММ-ДД» / baseName.
   // Відео й конспект однієї зустрічі лягають сюди разом.
   async function getMeetingFolderId(token, baseName) {
-    const root = await getOrCreateFolder(token, 'Запис зустрічей', null);
+    const root = await getOrCreateFolder(token, 'Meeting Recordings', null);
     const day = (baseName.match(/\d{4}-\d{2}-\d{2}/) || [])[0];
     const parent = day ? await getOrCreateFolder(token, day, root) : root;
     return getOrCreateFolder(token, baseName, parent);
