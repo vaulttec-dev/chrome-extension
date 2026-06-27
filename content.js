@@ -1,18 +1,21 @@
 // content.js — кнопка запису в Meet, захоплення (екран + мікрофон) і запис у самій
 // сторінці, а також ВЕЛИКІ аплоади (Drive / Gemini) — прямо звідси, щоб відео не
-// йшло через sendMessage. Чисті Drive/Gemini-функції — у gdrive.js / gemini.js
-// (підключені перед цим файлом). OAuth-токен бере service worker (chrome.identity
-// недоступний у content script) і віддає рядком за запитом.
+// йшло через sendMessage. Чисті Drive/Gemini-функції — у gdrive.js / gemini.js;
+// журнал шматків на диск — у recstore.js (підключені перед цим файлом). OAuth-токен
+// бере service worker (chrome.identity недоступний у content script) і віддає рядком.
 (() => {
   const MEET_CODE_RE = /^\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:$|[/?])/;
 
   let btn = null;
   let isRecording = false;
   let recorder = null;
-  let chunks = [];
+  let chunks = [];        // запасний шлях у пам'яті, якщо журнал IndexedDB недоступний
   let audioCtx = null;
   let streams = [];
   let capturedCode = null; // код зустрічі, зафіксований на старті (URL може змінитися на стопі)
+  let recId = null;        // id сесії в журналі IndexedDB (null → пишемо в пам'ять)
+  let recName = null;      // ім'я файлу, зафіксоване на старті
+  let recoveryBanner = null;
 
   function meetCode() {
     const m = location.pathname.match(MEET_CODE_RE);
@@ -121,14 +124,30 @@
 
       // Фіксований бітрейт під 720p — менше навантаження на CPU-кодування.
       recorder = new MediaRecorder(mixed, { mimeType: mime, videoBitsPerSecond: 2_500_000 });
-      recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+
+      // Журнал на диск: ім'я й id фіксуємо на старті, щоб відновлений файл був ідентичний.
+      capturedCode = meetCode();
+      const startedAt = Date.now();
+      recName = `Meet ${capturedCode ? capturedCode + ' ' : ''}${timestamp()}.webm`;
+      try {
+        recId = await RecStore.startSession({ id: `${startedAt}-${capturedCode || 'meet'}`, name: recName, code: capturedCode, mime: 'video/webm', startedAt });
+      } catch (e) {
+        console.warn('[MeetRec] журнал недоступний, пишу в пам\'ять:', e);
+        recId = null;
+      }
+
+      recorder.ondataavailable = (e) => {
+        if (!e.data || !e.data.size) return;
+        if (recId) RecStore.appendChunk(recId, e.data).catch((err) => console.warn('[MeetRec] appendChunk:', err));
+        else chunks.push(e.data);
+      };
       recorder.onstop = onRecorderStop;
       display.getVideoTracks()[0].addEventListener('ended', stopCapture);
       recorder.start(1000);
 
-      capturedCode = meetCode();
       isRecording = true;
       render();
+      removeRecoveryBanner(); // йде новий запис — старий банер відновлення прибрати
       chrome.runtime.sendMessage({ target: 'bg', type: 'BADGE', on: true });
 
       const missing = [];
@@ -149,8 +168,11 @@
   }
 
   async function onRecorderStop() {
-    const blob = new Blob(chunks, { type: 'video/webm' });
-    const name = `Meet ${capturedCode ? capturedCode + ' ' : ''}${timestamp()}.webm`;
+    const id = recId;
+    const name = recName || `Meet ${capturedCode ? capturedCode + ' ' : ''}${timestamp()}.webm`;
+    // Транзакції IndexedDB на 'chunks' серіалізовані за порядком створення, тож readBlob
+    // (створена після appendChunk останнього шматка) гарантовано бачить увесь запис.
+    const blob = id ? await RecStore.readBlob(id, 'video/webm') : new Blob(chunks, { type: 'video/webm' });
     cleanupStreams();
     isRecording = false;
     render();
@@ -162,12 +184,15 @@
       setStatus(saved.where === 'drive'
         ? 'Готово ✓ — збережено в Google Drive'
         : 'Готово ✓ — збережено локально (тека «Завантаження»)');
+      if (id) await RecStore.deleteSession(id); // відео в безпеці → журнал більше не потрібен
       await maybeGemini(blob, name, saved.folderId); // ставить власні статуси
     } catch (e) {
+      // Сесію НЕ видаляємо → запис відновиться при наступному відкритті Meet.
       setStatus('Помилка збереження: ' + ((e && e.message) || e));
     } finally {
       recorder = null;
       chunks = [];
+      recId = null;
     }
   }
 
@@ -222,6 +247,82 @@
     }
   }
 
+  // ---- Відновлення урваного запису ----
+  async function initRecovery() {
+    try {
+      await RecStore.pruneOld();
+      const orphans = await RecStore.listOrphans();
+      if (orphans.length && !isRecording) showRecoveryBanner(orphans[0]);
+    } catch (e) {
+      console.warn('[MeetRec] recovery init:', e);
+    }
+  }
+
+  function mkBtn(label, onClickFn) {
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.textContent = label;
+    x.addEventListener('click', onClickFn);
+    return x;
+  }
+  function removeRecoveryBanner() { if (recoveryBanner) { recoveryBanner.remove(); recoveryBanner = null; } }
+
+  async function showRecoveryBanner(session) {
+    if (recoveryBanner) return;
+    const secs = await RecStore.countChunks(session.id).catch(() => 0);
+    const when = new Date(session.startedAt).toLocaleString();
+    const dur = secs ? ` (~${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')})` : '';
+
+    const b = document.createElement('div');
+    b.id = 'meet-rec-recovery';
+    const txt = document.createElement('span');
+    txt.className = 'mrr-text';
+    txt.textContent = `Незавершений запис від ${when}${dur}`;
+    b.append(
+      txt,
+      mkBtn('Зберегти на Drive', () => recover(session, true)),
+      mkBtn('Завантажити', () => recover(session, false)),
+      mkBtn('✕', () => dismissRecovery(session))
+    );
+    document.body.appendChild(b);
+    recoveryBanner = b;
+  }
+
+  async function dismissRecovery(session) {
+    removeRecoveryBanner();
+    try { await RecStore.deleteSession(session.id); } catch (e) { console.warn('[MeetRec] dismiss:', e); }
+  }
+
+  async function recover(session, toDrive) {
+    removeRecoveryBanner();
+    try {
+      setStatus('Відновлення запису…');
+      const blob = await RecStore.readBlob(session.id, session.mime || 'video/webm');
+      if (!blob.size) {
+        setStatus('Відновлення: запис порожній');
+        await RecStore.deleteSession(session.id);
+        return;
+      }
+      const name = session.name || `Meet ${session.code ? session.code + ' ' : ''}recovered.webm`;
+      if (toDrive) {
+        const saved = await saveRecording(blob, name);
+        setStatus(saved.where === 'drive'
+          ? 'Відновлено ✓ — збережено в Google Drive'
+          : 'Відновлено ✓ — збережено локально');
+        await RecStore.deleteSession(session.id);
+        await maybeGemini(blob, name, saved.folderId);
+      } else {
+        downloadLocally(blob, name);
+        setStatus('Відновлено ✓ — файл завантажується');
+        await RecStore.deleteSession(session.id);
+      }
+    } catch (e) {
+      // Сесію лишаємо — можна спробувати ще раз (банер з'явиться при наступному відкритті).
+      setStatus('Відновлення не вдалося: ' + ((e && e.message) || e));
+      showRecoveryBanner(session);
+    }
+  }
+
   function cleanupStreams() {
     for (const s of streams) s.getTracks().forEach((t) => t.stop());
     streams = [];
@@ -231,6 +332,7 @@
     cleanupStreams();
     recorder = null;
     chunks = [];
+    recId = null;
     isRecording = false;
     render();
   }
@@ -253,4 +355,7 @@
     if (onMeeting) ensureButton(); else removeButton();
     if (isRecording && (!onMeeting || leftCall())) stopCapture();
   }, 1000);
+
+  // Перевірити, чи лишився урваний запис від минулого разу.
+  initRecovery();
 })();

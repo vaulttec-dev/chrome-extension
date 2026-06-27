@@ -11,7 +11,7 @@
   "content_scripts": [
     {
       "matches": ["https://meet.google.com/*"],
-      "js": ["gdrive.js", "gemini.js", "content.js"],
+      "js": ["recstore.js", "gdrive.js", "gemini.js", "content.js"],
       "css": ["content.css"],
       "run_at": "document_idle"
     }
