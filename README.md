@@ -20,20 +20,26 @@
 
 ## Як це влаштовано
 
-Захоплення й запис відбуваються **в самій сторінці Meet** (content script) — бо там уже
-є дозвіл на мікрофон. Service worker лише зберігає готовий файл.
+Захоплення, запис **і великі аплоади** (Drive / заливання у Gemini) відбуваються **в самій
+сторінці Meet** (content script) — бо там уже є дозвіл на мікрофон, а головне: відео-файл не
+ганяється через `sendMessage`, а вантажиться `fetch`'ем прямо звідси. Service worker дає
+content script'у OAuth-токен (бо `chrome.identity` доступний лише там) і веде дрібну фонову
+обробку Gemini через `chrome.alarms` — незалежно від того, чи відкрита вкладка Meet.
 
 | Файл | Роль |
 |------|------|
-| `manifest.json` | Дозволи (`identity`, `storage`, `downloads`), OAuth, реєстрація скриптів. |
-| `content.js` / `content.css` | Кнопка в Meet, детекція дзвінка, захоплення (`getDisplayMedia` + мікрофон), `MediaRecorder`. |
-| `background.js` | Збереження (Google Drive / локально) + авто-конспект через Gemini (Files API → `generateContent` → Google Doc). |
+| `manifest.json` | Дозволи (`identity`, `storage`, `downloads`, `alarms`), OAuth, реєстрація скриптів. |
+| `content.js` / `content.css` | Кнопка в Meet, детекція дзвінка, захоплення (`getDisplayMedia` + мікрофон), `MediaRecorder`, аплоад відео на Drive (або локально) і заливання відео в Gemini. |
+| `gdrive.js` / `gemini.js` | Чисті функції Drive / Gemini (приймають токен/ключ) — спільні для content script і service worker, без дублювання. |
+| `background.js` | OAuth-токен для content script, резервна зупинка, фоновий конспект через `chrome.alarms` (Files API → `generateContent` → Google Doc / `.txt`). |
 | `popup.html` / `popup.js` | Статус запису + резервна кнопка «Зупинити». |
 | `icons/` | Іконки (червона крапка). |
 
 Потік: клік «● Запис» → `getDisplayMedia({preferCurrentTab})` + `getUserMedia` (мікрофон) →
-мікс аудіо → `MediaRecorder` (WebM) → на стоп файл як data URL передається у `background.js`
-→ спроба Drive, інакше локально.
+мікс аудіо → `MediaRecorder` (WebM) → на стоп `content.js` бере токен у `background.js` і
+вантажить відео на Drive (інакше локально), потім (якщо є ключ) заливає відео в Gemini й
+передає `background.js` дрібну задачу — той по `chrome.alarms` чекає обробки, генерує конспект
+і кладе Google Документом у ту саму теку.
 
 ---
 
@@ -84,9 +90,11 @@
 проєкту, у якому видано ключ.
 
 Технічна примітка: надсилається саме відео (`video/webm`) з `mediaResolution: LOW` — бо
-MediaRecorder дає `webm/opus`, який Gemini не приймає як аудіо, а конвертація в service
-worker неможлива (немає Web Audio API). Низька роздільність кадрів тримає запит у межах
-лімітів навіть для довгих зустрічей.
+`MediaRecorder` дає `webm/opus`, який Gemini не приймає як чисте аудіо. Відео заливається в
+Gemini Files API прямо з content script (де воно вже в пам'яті), а очікування обробки й
+генерацію конспекту веде service worker фоново через `chrome.alarms`, тож вкладку Meet можна
+закрити одразу. Низька роздільність кадрів тримає запит у межах лімітів навіть для довгих
+зустрічей.
 
 ## Обмеження
 - **Старт лише за кліком** (Chrome не дозволяє почати захоплення без жесту користувача).

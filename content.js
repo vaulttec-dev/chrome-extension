@@ -1,5 +1,8 @@
-// content.js — кнопка запису в Meet + захоплення (екран + мікрофон) і запис у самій сторінці.
-// Запис ведеться тут (а не в offscreen), бо сторінка Meet уже має дозвіл на мікрофон.
+// content.js — кнопка запису в Meet, захоплення (екран + мікрофон) і запис у самій
+// сторінці, а також ВЕЛИКІ аплоади (Drive / Gemini) — прямо звідси, щоб відео не
+// йшло через sendMessage. Чисті Drive/Gemini-функції — у gdrive.js / gemini.js
+// (підключені перед цим файлом). OAuth-токен бере service worker (chrome.identity
+// недоступний у content script) і віддає рядком за запитом.
 (() => {
   const MEET_CODE_RE = /^\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:$|[/?])/;
 
@@ -9,6 +12,7 @@
   let chunks = [];
   let audioCtx = null;
   let streams = [];
+  let capturedCode = null; // код зустрічі, зафіксований на старті (URL може змінитися на стопі)
 
   function meetCode() {
     const m = location.pathname.match(MEET_CODE_RE);
@@ -31,6 +35,28 @@
   function setStatus(text) {
     console.log('[MeetRec]', text);
     chrome.runtime.sendMessage({ target: 'bg', type: 'STATUS', text });
+  }
+  function sendBg(msg) { return chrome.runtime.sendMessage({ target: 'bg', ...msg }); }
+
+  // ---- OAuth токен через service worker (з оновленням на 401) ----
+  async function requestToken(refreshOld) {
+    const r = await sendBg(refreshOld
+      ? { type: 'REFRESH_TOKEN', token: refreshOld }
+      : { type: 'GET_TOKEN' });
+    if (!r || !r.ok) throw new Error((r && r.error) || 'no token');
+    return r.token;
+  }
+  async function withToken(fn) {
+    let token = await requestToken();
+    try {
+      return await fn(token);
+    } catch (e) {
+      if (e && e.status === 401) {
+        token = await requestToken(token);
+        return await fn(token);
+      }
+      throw e;
+    }
   }
 
   // ---- UI ----
@@ -100,6 +126,7 @@
       display.getVideoTracks()[0].addEventListener('ended', stopCapture);
       recorder.start(1000);
 
+      capturedCode = meetCode();
       isRecording = true;
       render();
       chrome.runtime.sendMessage({ target: 'bg', type: 'BADGE', on: true });
@@ -123,22 +150,19 @@
 
   async function onRecorderStop() {
     const blob = new Blob(chunks, { type: 'video/webm' });
-    const name = `Meet ${meetCode() ? meetCode() + ' ' : ''}${timestamp()}.webm`;
+    const name = `Meet ${capturedCode ? capturedCode + ' ' : ''}${timestamp()}.webm`;
     cleanupStreams();
     isRecording = false;
     render();
     chrome.runtime.sendMessage({ target: 'bg', type: 'BADGE', on: false });
 
     try {
-      const dataUrl = await blobToDataURL(blob);
-      const res = await chrome.runtime.sendMessage({ target: 'bg', type: 'SAVE', dataUrl, name });
-      if (res && res.ok) {
-        setStatus(res.where === 'drive'
-          ? 'Готово ✓ — збережено в Google Drive'
-          : 'Готово ✓ — збережено локально (тека «Завантаження»)');
-      } else {
-        setStatus('Помилка збереження: ' + ((res && res.error) || '?'));
-      }
+      setStatus('Збереження…');
+      const saved = await saveRecording(blob, name);
+      setStatus(saved.where === 'drive'
+        ? 'Готово ✓ — збережено в Google Drive'
+        : 'Готово ✓ — збережено локально (тека «Завантаження»)');
+      await maybeGemini(blob, name, saved.folderId); // ставить власні статуси
     } catch (e) {
       setStatus('Помилка збереження: ' + ((e && e.message) || e));
     } finally {
@@ -147,14 +171,57 @@
     }
   }
 
-  function blobToDataURL(blob) {
-    return new Promise((resolve, reject) => {
-      const r = new FileReader();
-      r.onload = () => resolve(r.result);
-      r.onerror = () => reject(r.error || new Error('FileReader error'));
-      r.readAsDataURL(blob);
-    });
+  // Спершу Drive (великий аплоад прямо звідси); якщо не вдалося — локально.
+  async function saveRecording(blob, name) {
+    try {
+      const { folderId } = await withToken((token) => GDrive.uploadResumable(token, blob, name));
+      return { where: 'drive', folderId };
+    } catch (driveErr) {
+      console.warn('[MeetRec] Drive недоступний, зберігаю локально:', driveErr);
+      downloadLocally(blob, name);
+      return { where: 'local', folderId: null };
+    }
   }
+
+  // Локальне збереження без передачі blob у SW: object URL + програмний <a download>.
+  function downloadLocally(blob, name) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
+  // Якщо є Gemini-ключ — заливаємо відео в Gemini (великий аплоад тут), далі
+  // дрібну обробку (очікування → генерація → Google Doc) веде service worker.
+  async function maybeGemini(blob, name, folderId) {
+    const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
+    if (!geminiApiKey) return;
+    const baseName = name.replace(/\.webm$/i, '');
+    try {
+      setStatus('Готую конспект (надсилаю відео в Gemini)…');
+      const file = await Gemini.geminiUploadFile(blob, geminiApiKey);
+      await sendBg({
+        type: 'GEMINI_CONTINUE',
+        job: {
+          geminiFileName: file.name,
+          fileUri: file.uri,
+          mimeType: file.mimeType,
+          docName: baseName + ' — конспект',
+          meetingBaseName: baseName,
+          folderId: folderId || null
+        }
+      });
+      setStatus('Конспект робиться у фоні — вкладку можна закрити.');
+    } catch (e) {
+      console.warn('[MeetRec] Gemini upload помилка:', e);
+      setStatus('Конспект не вдалося надіслати в Gemini: ' + ((e && e.message) || e));
+    }
+  }
+
   function cleanupStreams() {
     for (const s of streams) s.getTracks().forEach((t) => t.stop());
     streams = [];
