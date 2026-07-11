@@ -39,7 +39,7 @@
   }
 
   function setStatus(text) {
-    console.log('[MeetRec]', text);
+    MRLog.log('info', 'status', text);
     chrome.runtime.sendMessage({ target: 'bg', type: 'STATUS', text });
   }
   function sendBg(msg) { return chrome.runtime.sendMessage({ target: 'bg', ...msg }); }
@@ -135,13 +135,13 @@
       try {
         recId = await RecStore.startSession({ id: `${startedAt}-${capturedCode || 'meet'}`, name: recName, code: capturedCode, mime: 'video/webm', startedAt });
       } catch (e) {
-        console.warn('[MeetRec] журнал недоступний, пишу в пам\'ять:', e);
+        MRLog.log('warn', 'record', 'Журнал IndexedDB недоступний, пишу в пам\'ять (без захисту від обриву): ' + ((e && e.message) || e));
         recId = null;
       }
 
       recorder.ondataavailable = (e) => {
         if (!e.data || !e.data.size) return;
-        if (recId) RecStore.appendChunk(recId, e.data, 'video').catch((err) => console.warn('[MeetRec] appendChunk:', err));
+        if (recId) RecStore.appendChunk(recId, e.data, 'video').catch((err) => MRLog.log('warn', 'record', 'Втрачено відео-шматок: ' + ((err && err.message) || err)));
         else chunks.push(e.data);
       };
       recorder.onstop = onRecorderStop;
@@ -156,7 +156,7 @@
       audioStopPromise = new Promise((resolve) => { audioRecorder.onstop = resolve; });
       audioRecorder.ondataavailable = (e) => {
         if (!e.data || !e.data.size) return;
-        if (recId) RecStore.appendChunk(recId, e.data, 'audio').catch((err) => console.warn('[MeetRec] appendChunk audio:', err));
+        if (recId) RecStore.appendChunk(recId, e.data, 'audio').catch((err) => MRLog.log('warn', 'record', 'Втрачено аудіо-шматок: ' + ((err && err.message) || err)));
         else audioChunks.push(e.data);
       };
 
@@ -172,8 +172,10 @@
       const missing = [];
       if (!mic) missing.push('без мікрофона [' + (micError || '?') + ']');
       if (!display.getAudioTracks().length) missing.push('без звуку вкладки — поставте галочку в діалозі');
+      MRLog.log('info', 'record', 'Старт запису: ' + recName + (missing.length ? ' [' + missing.join('; ') + ']' : '') + (recId ? '' : ' (у пам\'ять — журнал недоступний)'));
       setStatus(missing.length ? 'Запис… (' + missing.join('; ') + ')' : 'Запис…');
     } catch (e) {
+      MRLog.log('warn', 'record', 'Старт скасовано/помилка: ' + ((e && e.message) || e));
       setStatus('Скасовано: ' + ((e && e.message) || e));
       cleanup();
     }
@@ -209,10 +211,12 @@
       setStatus(saved.where === 'drive'
         ? 'Готово ✓ — збережено в Google Drive'
         : 'Готово ✓ — збережено локально (тека «Завантаження»)');
+      MRLog.log('info', 'save', 'Запис збережено (' + saved.where + '): ' + name);
       if (id) await RecStore.deleteSession(id); // відео в безпеці → журнал більше не потрібен
       await maybeGemini(audioBlob, name, saved.folderId); // ставить власні статуси
     } catch (e) {
       // Сесію НЕ видаляємо → запис відновиться при наступному відкритті Meet.
+      MRLog.log('error', 'save', 'Помилка збереження (запис лишається для відновлення): ' + ((e && e.message) || e));
       setStatus('Помилка збереження: ' + ((e && e.message) || e));
     } finally {
       recorder = null;
@@ -230,7 +234,7 @@
       const { folderId } = await withToken((token) => GDrive.uploadResumable(token, blob, name));
       return { where: 'drive', folderId };
     } catch (driveErr) {
-      console.warn('[MeetRec] Drive недоступний, зберігаю локально:', driveErr);
+      MRLog.log('warn', 'save', 'Drive недоступний, зберігаю локально: ' + ((driveErr && driveErr.message) || driveErr));
       downloadLocally(blob, name);
       return { where: 'local', folderId: null };
     }
@@ -252,8 +256,14 @@
   // дрібну обробку (очікування → генерація → Google Doc) веде service worker.
   async function maybeGemini(audioBlob, name, folderId) {
     const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
-    if (!geminiApiKey) return;
-    if (!audioBlob || !audioBlob.size) { setStatus('Конспект пропущено: немає аудіо у записі'); return; }
+    if (!geminiApiKey) { MRLog.log('info', 'gemini', 'Конспект пропущено: не задано Gemini-ключ'); return; }
+    // Свідомо шлемо ЛИШЕ аудіо-доріжку. Повне відео сюди слати не можна: години 720p —
+    // це ГБ і не влазить у ліміт файлу/контекст, конспект гарантовано впаде або таймаутиться.
+    if (!audioBlob || !audioBlob.size) {
+      MRLog.log('warn', 'gemini', 'Конспект пропущено: у записі немає аудіо-доріжки (старий запис або без звуку): ' + name);
+      setStatus('Конспект пропущено: у записі немає окремої аудіо-доріжки (старий запис або без звуку)');
+      return;
+    }
     const baseName = name.replace(/\.webm$/i, '');
     try {
       setStatus('Готую конспект (надсилаю аудіо в Gemini)…');
@@ -269,9 +279,10 @@
           folderId: folderId || null
         }
       });
+      MRLog.log('info', 'gemini', 'Аудіо залито в Gemini, конспект робиться у фоні: ' + baseName);
       setStatus('Конспект робиться у фоні — вкладку можна закрити.');
     } catch (e) {
-      console.warn('[MeetRec] Gemini upload помилка:', e);
+      MRLog.log('error', 'gemini', 'Не вдалося залити аудіо в Gemini: ' + ((e && e.message) || e));
       setStatus('Конспект не вдалося надіслати в Gemini: ' + ((e && e.message) || e));
     }
   }
@@ -281,9 +292,12 @@
     try {
       await RecStore.pruneOld();
       const orphans = await RecStore.listOrphans();
-      if (orphans.length && !isRecording) showRecoveryBanner(orphans[0]);
+      if (orphans.length && !isRecording) {
+        MRLog.log('info', 'recovery', 'Знайдено незавершений запис: ' + (orphans[0].name || orphans[0].id));
+        showRecoveryBanner(orphans[0]);
+      }
     } catch (e) {
-      console.warn('[MeetRec] recovery init:', e);
+      MRLog.log('warn', 'recovery', 'Помилка ініціалізації відновлення: ' + ((e && e.message) || e));
     }
   }
 
@@ -319,36 +333,46 @@
 
   async function dismissRecovery(session) {
     removeRecoveryBanner();
-    try { await RecStore.deleteSession(session.id); } catch (e) { console.warn('[MeetRec] dismiss:', e); }
+    try {
+      await RecStore.deleteSession(session.id);
+      MRLog.log('info', 'recovery', 'Незавершений запис відхилено користувачем: ' + (session.name || session.id));
+    } catch (e) { MRLog.log('warn', 'recovery', 'Не вдалося видалити сесію: ' + ((e && e.message) || e)); }
   }
 
   async function recover(session, toDrive) {
     removeRecoveryBanner();
     try {
+      MRLog.log('info', 'recovery', 'Відновлення (' + (toDrive ? 'на Drive' : 'локально') + '): ' + (session.name || session.id));
       setStatus('Відновлення запису…');
       const blob = await RecStore.readBlob(session.id, session.mime || 'video/webm');
       if (!blob.size) {
+        MRLog.log('warn', 'recovery', 'Запис порожній, видаляю: ' + session.id);
         setStatus('Відновлення: запис порожній');
         await RecStore.deleteSession(session.id);
         return;
       }
       const name = session.name || `Meet ${session.code ? session.code + ' ' : ''}recovered.webm`;
+      // Аудіо-доріжку читаємо ДО видалення сесії. Повне відео в Gemini НЕ шлемо (завелике → провал);
+      // якщо аудіо нема (стара сесія / без звуку) — maybeGemini чесно пропустить конспект.
+      const audioBlob = await RecStore.readBlob(session.id, 'audio/webm', 'audio').catch(() => null);
+      let folderId = null;
       if (toDrive) {
         const saved = await saveRecording(blob, name);
+        folderId = saved.folderId;
         setStatus(saved.where === 'drive'
           ? 'Відновлено ✓ — збережено в Google Drive'
           : 'Відновлено ✓ — збережено локально');
-        // Аудіо-доріжку з журналу шлемо в Gemini; якщо її нема (старі сесії) — фолбек на відео.
-        const audioBlob = await RecStore.readBlob(session.id, 'audio/webm', 'audio').catch(() => null);
-        await RecStore.deleteSession(session.id);
-        await maybeGemini(audioBlob && audioBlob.size ? audioBlob : blob, name, saved.folderId);
       } else {
         downloadLocally(blob, name);
         setStatus('Відновлено ✓ — файл завантажується');
-        await RecStore.deleteSession(session.id);
       }
+      MRLog.log('info', 'recovery', 'Відео відновлено (' + (toDrive ? 'drive' : 'local') + '): ' + name);
+      await RecStore.deleteSession(session.id);
+      // Конспект тепер робиться в ОБОХ гілках (раніше «Завантажити» його пропускало).
+      await maybeGemini(audioBlob, name, folderId);
     } catch (e) {
       // Сесію лишаємо — можна спробувати ще раз (банер з'явиться при наступному відкритті).
+      MRLog.log('error', 'recovery', 'Відновлення не вдалося (запис лишається): ' + ((e && e.message) || e));
       setStatus('Відновлення не вдалося: ' + ((e && e.message) || e));
       showRecoveryBanner(session);
     }

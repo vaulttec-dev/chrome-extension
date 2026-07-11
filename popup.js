@@ -45,3 +45,41 @@ saveKeyBtn.addEventListener('click', () => {
     renderKeyState(key);
   });
 });
+
+// ---- Історія (персистентний лог) ----
+const logEl = document.getElementById('log');
+const clearLogBtn = document.getElementById('clearlog');
+
+function fmtTime(t) {
+  const d = new Date(t);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function renderLog(logs) {
+  const arr = Array.isArray(logs) ? logs : [];
+  if (!arr.length) { logEl.innerHTML = '<span class="empty">Поки що порожньо.</span>'; return; }
+  // найновіші зверху
+  logEl.innerHTML = '';
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const e = arr[i];
+    const row = document.createElement('div');
+    row.className = 'row' + (e.lvl === 'warn' ? ' warn' : e.lvl === 'error' ? ' error' : '');
+    const t = document.createElement('span');
+    t.className = 't';
+    t.textContent = fmtTime(e.t) + ' ';
+    row.appendChild(t);
+    row.appendChild(document.createTextNode('[' + (e.stage || '') + '] ' + (e.msg || '')));
+    logEl.appendChild(row);
+  }
+}
+
+chrome.storage.local.get('logs').then(({ logs }) => renderLog(logs));
+
+clearLogBtn.addEventListener('click', () => {
+  chrome.storage.local.remove('logs').then(() => renderLog([]));
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.logs) renderLog(changes.logs.newValue);
+});

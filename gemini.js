@@ -111,10 +111,12 @@
       throw new Error('gemini generate ' + r.status + ' ' + t.slice(0, 200));
     }
     const d = await r.json();
-    const parts = d && d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts;
+    const cand = d && d.candidates && d.candidates[0];
+    const parts = cand && cand.content && cand.content.parts;
+    const finishReason = cand && cand.finishReason; // 'STOP' норм; 'MAX_TOKENS'/'SAFETY'/… = обрізано
     const text = parts ? parts.map((p) => p.text).filter(Boolean).join('\n').trim() : '';
-    if (!text) throw new Error('gemini: порожня відповідь');
-    return text;
+    if (!text) throw new Error('gemini: порожня відповідь' + (finishReason ? ' (finishReason: ' + finishReason + ')' : ''));
+    return { text, finishReason };
   }
 
   g.Gemini = { GEMINI_MODEL, GEMINI_PROMPT, geminiUploadFile, geminiGetFile, geminiGenerate };

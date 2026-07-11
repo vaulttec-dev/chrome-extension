@@ -1,12 +1,29 @@
 // background.js — service worker: бейдж/стан, OAuth-токен для content script,
 // резервна зупинка, і фонова Gemini-обробка через chrome.alarms.
 // Захоплення, запис і великі аплоади (Drive/Gemini) — у content script.
-importScripts('gdrive.js', 'gemini.js');
+importScripts('logstore.js', 'gdrive.js', 'gemini.js');
 
 const GEMINI_ALARM = 'geminiPoll';
 const GEMINI_MAX_TICKS = 60; // ~30 хв при періоді 0.5 хв — багатогодинне аудіо довго в стані PROCESSING
 
-function setStatus(text) { chrome.storage.local.set({ lastStatus: text }); }
+function setStatus(text) {
+  chrome.storage.local.set({ lastStatus: text });
+  MRLog.log('info', 'status', text);
+}
+
+// Системна нотифікація — головний канал для фонового конспекту (вкладку Meet уже закрито).
+function notify(title, message) {
+  try {
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title,
+      message: String(message || '')
+    });
+  } catch (e) {
+    MRLog.log('warn', 'notify', e);
+  }
+}
 
 // ---- OAuth токен (chrome.identity доступний лише тут, не в content script) ----
 
@@ -139,23 +156,27 @@ async function pollGeminiJob() {
       if (file.state === 'PROCESSING') {
         job.ticks = (job.ticks || 0) + 1;
         if (job.ticks >= GEMINI_MAX_TICKS) {
-          await finishGeminiJob('Конспект не вдалося зробити: тайм-аут обробки відео');
+          await finishGeminiJob('Конспект не вдалося зробити: тайм-аут обробки аудіо', false);
         } else {
           await chrome.storage.local.set({ geminiJob: job });
         }
         return;
       }
       if (file.state === 'FAILED') {
-        await finishGeminiJob('Конспект не вдалося зробити: Gemini не обробив відео');
+        await finishGeminiJob('Конспект не вдалося зробити: Gemini не обробив аудіо', false);
         return;
       }
 
       // ACTIVE → генеруємо конспект і кладемо у Drive (або локально .txt).
-      const text = await Gemini.geminiGenerate(file.uri || job.fileUri, file.mimeType || job.mimeType, geminiApiKey);
-      await finishGeminiJob(await saveDoc(job, text));
+      const { text, finishReason } = await Gemini.geminiGenerate(file.uri || job.fileUri, file.mimeType || job.mimeType, geminiApiKey);
+      const truncated = finishReason && finishReason !== 'STOP';
+      if (truncated) MRLog.log('warn', 'gemini', 'Конспект міг обрізатися (finishReason: ' + finishReason + ')', { rec: job.meetingBaseName });
+      let status = await saveDoc(job, text);
+      if (truncated) status += ' (увага: конспект може бути неповним — ' + finishReason + ')';
+      await finishGeminiJob(status, !truncated);
     } catch (e) {
-      console.warn('[MeetRec] Gemini помилка:', e);
-      await finishGeminiJob('Конспект не вдалося зробити: ' + ((e && e.message) || e));
+      MRLog.log('error', 'gemini', e, { rec: job && job.meetingBaseName });
+      await finishGeminiJob('Конспект не вдалося зробити: ' + ((e && e.message) || e), false);
     }
   } finally {
     geminiBusy = false;
@@ -171,14 +192,16 @@ async function saveDoc(job, text) {
     });
     return 'Конспект готовий ✓ — у теці «Meeting Recordings»';
   } catch (docErr) {
-    console.warn('[MeetRec] Doc у Drive не вдалося, зберігаю локально:', docErr);
+    MRLog.log('warn', 'gemini', 'Doc у Drive не вдалося, зберігаю локально .txt: ' + ((docErr && docErr.message) || docErr));
     await download('data:text/plain;charset=utf-8,' + encodeURIComponent(text), job.docName + '.txt');
     return 'Конспект готовий ✓ — збережено локально (.txt)';
   }
 }
 
-async function finishGeminiJob(status) {
+// ok=true → успіх (зелена нотифікація), false → провал/неповний конспект.
+async function finishGeminiJob(status, ok) {
   await chrome.alarms.clear(GEMINI_ALARM);
   await chrome.storage.local.remove('geminiJob');
   setStatus(status);
+  notify(ok ? 'Конспект готовий' : 'Конспект: проблема', status);
 }
