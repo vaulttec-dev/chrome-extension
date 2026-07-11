@@ -145,6 +145,8 @@
         else chunks.push(e.data);
       };
       recorder.onstop = onRecorderStop;
+      // Помилка енкодера/диска не має мовчати: лог + фіналізація однаково прийде через onstop.
+      recorder.onerror = (e) => MRLog.log('error', 'record', 'Помилка відео-рекордера: ' + ((e && e.error && e.error.message) || (e && e.error) || e));
 
       // Паралельно пишемо лише змікшований звук (вкладка + мікрофон) окремою доріжкою.
       // У Gemini шлемо саме її: відео 720p за кілька годин — це ГБ і мільйони токенів,
@@ -159,6 +161,7 @@
         if (recId) RecStore.appendChunk(recId, e.data, 'audio').catch((err) => MRLog.log('warn', 'record', 'Втрачено аудіо-шматок: ' + ((err && err.message) || err)));
         else audioChunks.push(e.data);
       };
+      audioRecorder.onerror = (e) => MRLog.log('error', 'record', 'Помилка аудіо-рекордера: ' + ((e && e.error && e.error.message) || (e && e.error) || e));
 
       display.getVideoTracks()[0].addEventListener('ended', stopCapture);
       recorder.start(1000);
@@ -196,6 +199,9 @@
     // (створена після appendChunk останнього шматка) гарантовано бачить увесь запис.
     const blob = id ? await RecStore.readBlob(id, 'video/webm') : new Blob(chunks, { type: 'video/webm' });
     // Дочекатися, поки аудіо-рекордер скине останній шматок, і зібрати аудіо-доріжку для Gemini.
+    // Якщо стоп прийшов не через stopCapture (напр. відео-рекордер упав сам) — дозупинити
+    // аудіо тут, інакше audioStopPromise ніколи не резолвиться і збереження зависне.
+    if (audioRecorder && audioRecorder.state !== 'inactive') { try { audioRecorder.stop(); } catch (_) {} }
     if (audioStopPromise) await audioStopPromise;
     const audioBlob = id
       ? await RecStore.readBlob(id, 'audio/webm', 'audio')
@@ -212,8 +218,15 @@
         ? 'Готово ✓ — збережено в Google Drive'
         : 'Готово ✓ — збережено локально (тека «Завантаження»)');
       MRLog.log('info', 'save', 'Запис збережено (' + saved.where + '): ' + name);
-      if (id) await RecStore.deleteSession(id); // відео в безпеці → журнал більше не потрібен
-      await maybeGemini(audioBlob, name, saved.folderId); // ставить власні статуси
+      // Відео в безпеці → позначаємо це в журналі, але сесію тримаємо, поки аудіо не піде
+      // в Gemini: закриють вкладку під час аплоаду аудіо — конспект відновиться банером.
+      if (id) await RecStore.updateSession(id, { videoSaved: true, folderId: saved.folderId || null })
+        .catch((e2) => MRLog.log('warn', 'save', 'updateSession: ' + ((e2 && e2.message) || e2)));
+      const gemOk = await maybeGemini(audioBlob, name, saved.folderId); // ставить власні статуси
+      if (id) {
+        if (gemOk) await RecStore.deleteSession(id); // конспект у роботі або свідомо пропущено → журнал не потрібен
+        else MRLog.log('warn', 'gemini', 'Аудіо не пішло в Gemini — сесія лишається, конспект можна повторити банером у Meet');
+      }
     } catch (e) {
       // Сесію НЕ видаляємо → запис відновиться при наступному відкритті Meet.
       MRLog.log('error', 'save', 'Помилка збереження (запис лишається для відновлення): ' + ((e && e.message) || e));
@@ -254,21 +267,23 @@
 
   // Якщо є Gemini-ключ — заливаємо АУДІО в Gemini (великий аплоад тут), далі
   // дрібну обробку (очікування → генерація → Google Doc) веде service worker.
+  // Повертає true, коли повторювати нема чого (конспект запущено або свідомо пропущено),
+  // і false, коли аплоад/передача не вдалися — тоді сесію в журналі варто лишити на повтор.
   async function maybeGemini(audioBlob, name, folderId) {
     const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
-    if (!geminiApiKey) { MRLog.log('info', 'gemini', 'Конспект пропущено: не задано Gemini-ключ'); return; }
+    if (!geminiApiKey) { MRLog.log('info', 'gemini', 'Конспект пропущено: не задано Gemini-ключ'); return true; }
     // Свідомо шлемо ЛИШЕ аудіо-доріжку. Повне відео сюди слати не можна: години 720p —
     // це ГБ і не влазить у ліміт файлу/контекст, конспект гарантовано впаде або таймаутиться.
     if (!audioBlob || !audioBlob.size) {
       MRLog.log('warn', 'gemini', 'Конспект пропущено: у записі немає аудіо-доріжки (старий запис або без звуку): ' + name);
       setStatus('Конспект пропущено: у записі немає окремої аудіо-доріжки (старий запис або без звуку)');
-      return;
+      return true;
     }
     const baseName = name.replace(/\.webm$/i, '');
     try {
       setStatus('Готую конспект (надсилаю аудіо в Gemini)…');
       const file = await Gemini.geminiUploadFile(audioBlob, geminiApiKey, 'audio/webm');
-      await sendBg({
+      const r = await sendBg({
         type: 'GEMINI_CONTINUE',
         job: {
           geminiFileName: file.name,
@@ -279,11 +294,14 @@
           folderId: folderId || null
         }
       });
+      if (!r || !r.ok) throw new Error((r && r.error) || 'background не прийняв завдання');
       MRLog.log('info', 'gemini', 'Аудіо залито в Gemini, конспект робиться у фоні: ' + baseName);
       setStatus('Конспект робиться у фоні — вкладку можна закрити.');
+      return true;
     } catch (e) {
       MRLog.log('error', 'gemini', 'Не вдалося залити аудіо в Gemini: ' + ((e && e.message) || e));
       setStatus('Конспект не вдалося надіслати в Gemini: ' + ((e && e.message) || e));
+      return false;
     }
   }
 
@@ -320,13 +338,23 @@
     b.id = 'meet-rec-recovery';
     const txt = document.createElement('span');
     txt.className = 'mrr-text';
-    txt.textContent = `Незавершений запис від ${when}${dur}`;
-    b.append(
-      txt,
-      mkBtn('Зберегти на Drive', () => recover(session, true)),
-      mkBtn('Завантажити', () => recover(session, false)),
-      mkBtn('✕', () => dismissRecovery(session))
-    );
+    if (session.videoSaved) {
+      // Відео вже збережено — лишилося тільки зробити конспект з аудіо-доріжки.
+      txt.textContent = `Незавершений конспект від ${when}${dur}`;
+      b.append(
+        txt,
+        mkBtn('Зробити конспект', () => recover(session, true)),
+        mkBtn('✕', () => dismissRecovery(session))
+      );
+    } else {
+      txt.textContent = `Незавершений запис від ${when}${dur}`;
+      b.append(
+        txt,
+        mkBtn('Зберегти на Drive', () => recover(session, true)),
+        mkBtn('Завантажити', () => recover(session, false)),
+        mkBtn('✕', () => dismissRecovery(session))
+      );
+    }
     document.body.appendChild(b);
     recoveryBanner = b;
   }
@@ -342,34 +370,48 @@
   async function recover(session, toDrive) {
     removeRecoveryBanner();
     try {
-      MRLog.log('info', 'recovery', 'Відновлення (' + (toDrive ? 'на Drive' : 'локально') + '): ' + (session.name || session.id));
-      setStatus('Відновлення запису…');
-      const blob = await RecStore.readBlob(session.id, session.mime || 'video/webm');
-      if (!blob.size) {
-        MRLog.log('warn', 'recovery', 'Запис порожній, видаляю: ' + session.id);
-        setStatus('Відновлення: запис порожній');
-        await RecStore.deleteSession(session.id);
-        return;
-      }
+      MRLog.log('info', 'recovery', 'Відновлення (' + (session.videoSaved ? 'лише конспект' : toDrive ? 'на Drive' : 'локально') + '): ' + (session.name || session.id));
       const name = session.name || `Meet ${session.code ? session.code + ' ' : ''}recovered.webm`;
-      // Аудіо-доріжку читаємо ДО видалення сесії. Повне відео в Gemini НЕ шлемо (завелике → провал);
-      // якщо аудіо нема (стара сесія / без звуку) — maybeGemini чесно пропустить конспект.
-      const audioBlob = await RecStore.readBlob(session.id, 'audio/webm', 'audio').catch(() => null);
-      let folderId = null;
-      if (toDrive) {
-        const saved = await saveRecording(blob, name);
-        folderId = saved.folderId;
-        setStatus(saved.where === 'drive'
-          ? 'Відновлено ✓ — збережено в Google Drive'
-          : 'Відновлено ✓ — збережено локально');
+      let folderId = session.folderId || null;
+
+      if (!session.videoSaved) {
+        setStatus('Відновлення запису…');
+        const blob = await RecStore.readBlob(session.id, session.mime || 'video/webm');
+        if (!blob.size) {
+          MRLog.log('warn', 'recovery', 'Запис порожній, видаляю: ' + session.id);
+          setStatus('Відновлення: запис порожній');
+          await RecStore.deleteSession(session.id);
+          return;
+        }
+        if (toDrive) {
+          const saved = await saveRecording(blob, name);
+          folderId = saved.folderId || null;
+          setStatus(saved.where === 'drive'
+            ? 'Відновлено ✓ — збережено в Google Drive'
+            : 'Відновлено ✓ — збережено локально');
+        } else {
+          downloadLocally(blob, name);
+          setStatus('Відновлено ✓ — файл завантажується');
+        }
+        MRLog.log('info', 'recovery', 'Відео відновлено: ' + name);
+        // Відео в безпеці → якщо конспект далі урветься, банер запропонує лише конспект.
+        await RecStore.updateSession(session.id, { videoSaved: true, folderId })
+          .catch((e2) => MRLog.log('warn', 'recovery', 'updateSession: ' + ((e2 && e2.message) || e2)));
       } else {
-        downloadLocally(blob, name);
-        setStatus('Відновлено ✓ — файл завантажується');
+        setStatus('Відновлюю конспект…');
       }
-      MRLog.log('info', 'recovery', 'Відео відновлено (' + (toDrive ? 'drive' : 'local') + '): ' + name);
-      await RecStore.deleteSession(session.id);
-      // Конспект тепер робиться в ОБОХ гілках (раніше «Завантажити» його пропускало).
-      await maybeGemini(audioBlob, name, folderId);
+
+      // Повне відео в Gemini НЕ шлемо (завелике → гарантований провал) — лише аудіо-доріжку.
+      // Якщо її нема (стара сесія / запис без звуку) — maybeGemini чесно пропустить конспект.
+      const audioBlob = await RecStore.readBlob(session.id, 'audio/webm', 'audio').catch(() => null);
+      const gemOk = await maybeGemini(audioBlob, name, folderId);
+      if (gemOk) {
+        await RecStore.deleteSession(session.id);
+        initRecovery(); // якщо є ще незавершені сесії — одразу показати наступний банер
+      } else {
+        // Аудіо не пішло в Gemini — сесію лишаємо, банер одразу пропонує повторити конспект.
+        showRecoveryBanner({ ...session, videoSaved: true, folderId });
+      }
     } catch (e) {
       // Сесію лишаємо — можна спробувати ще раз (банер з'явиться при наступному відкритті).
       MRLog.log('error', 'recovery', 'Відновлення не вдалося (запис лишається): ' + ((e && e.message) || e));

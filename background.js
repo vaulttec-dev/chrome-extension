@@ -5,6 +5,7 @@ importScripts('logstore.js', 'gdrive.js', 'gemini.js');
 
 const GEMINI_ALARM = 'geminiPoll';
 const GEMINI_MAX_TICKS = 60; // ~30 хв при періоді 0.5 хв — багатогодинне аудіо довго в стані PROCESSING
+const GEMINI_MAX_ERRORS = 8; // ~4 хв повторів — разовий збій мережі чи 503 від Gemini не вбиває конспект
 
 function setStatus(text) {
   chrome.storage.local.set({ lastStatus: text });
@@ -127,12 +128,55 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // ---- Фонова Gemini-обробка (переживає засинання SW через chrome.alarms) ----
-// job = { geminiFileName, fileUri, mimeType, docName, meetingBaseName, folderId }
+// Черга завдань у storage.local.geminiJobs — конспекти НЕ перезаписують одне одного,
+// коли накладаються (нова зустріч, поки попередній конспект ще вариться; відновлення).
+// job = { geminiFileName, fileUri, mimeType, docName, meetingBaseName, folderId, ticks, errors }
+
+// Усі read-modify-write черги — через один ланцюжок, щоб push і видалення не губили одне одного.
+let queueChain = Promise.resolve();
+function withQueue(fn) {
+  const p = queueChain.then(fn, fn);
+  queueChain = p.then(() => {}, () => {});
+  return p;
+}
+async function readQueue() {
+  const { geminiJobs } = await chrome.storage.local.get('geminiJobs');
+  return Array.isArray(geminiJobs) ? geminiJobs : [];
+}
+function sameJob(a, b) { return a && b && a.geminiFileName === b.geminiFileName; }
 
 async function startGeminiJob(job) {
-  await chrome.storage.local.set({ geminiJob: { ...job, ticks: 0 } });
+  await withQueue(async () => {
+    const jobs = await readQueue();
+    jobs.push({ ...job, ticks: 0, errors: 0 });
+    await chrome.storage.local.set({ geminiJobs: jobs });
+  });
   setStatus('Роблю конспект через Gemini…');
   await chrome.alarms.create(GEMINI_ALARM, { periodInMinutes: 0.5 });
+}
+
+// Оновити поля завдання в черзі (шукаємо за geminiFileName — він унікальний на аплоад).
+function patchJob(job, patch) {
+  return withQueue(async () => {
+    const jobs = await readQueue();
+    const i = jobs.findIndex((j) => sameJob(j, job));
+    if (i >= 0) {
+      jobs[i] = { ...jobs[i], ...patch };
+      await chrome.storage.local.set({ geminiJobs: jobs });
+    }
+  });
+}
+
+// Прибрати завдання з черги + статус і нотифікація; alarm гасимо, лише коли черга порожня.
+async function finishJob(job, status, ok) {
+  await withQueue(async () => {
+    const jobs = (await readQueue()).filter((j) => !sameJob(j, job));
+    await chrome.storage.local.set({ geminiJobs: jobs });
+    if (!jobs.length) await chrome.alarms.clear(GEMINI_ALARM);
+  });
+  MRLog.log(ok ? 'info' : 'error', 'gemini', status, { rec: job.meetingBaseName });
+  setStatus(status);
+  notify(ok ? 'Конспект готовий' : 'Конспект: проблема', status);
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -147,23 +191,42 @@ async function pollGeminiJob() {
   if (geminiBusy) return;
   geminiBusy = true;
   try {
-    const { geminiJob: job, geminiApiKey } = await chrome.storage.local.get(['geminiJob', 'geminiApiKey']);
-    if (!job || !geminiApiKey) { await chrome.alarms.clear(GEMINI_ALARM); return; }
+    // Міграція одиночного geminiJob зі старої версії розширення в чергу.
+    const { geminiJob: legacy } = await chrome.storage.local.get('geminiJob');
+    if (legacy) {
+      await chrome.storage.local.remove('geminiJob');
+      await withQueue(async () => {
+        const jobs = await readQueue();
+        jobs.push({ ticks: 0, errors: 0, ...legacy });
+        await chrome.storage.local.set({ geminiJobs: jobs });
+      });
+    }
 
+    const jobs = await readQueue();
+    if (!jobs.length) { await chrome.alarms.clear(GEMINI_ALARM); return; }
+
+    const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
+    if (!geminiApiKey) {
+      // Без ключа завдання не виконати ніколи — чесно завершуємо, а не тримаємо вічно.
+      for (const j of jobs) MRLog.log('error', 'gemini', 'Конспект скасовано: не задано Gemini-ключ', { rec: j.meetingBaseName });
+      await withQueue(() => chrome.storage.local.set({ geminiJobs: [] }));
+      await chrome.alarms.clear(GEMINI_ALARM);
+      notify('Конспект: проблема', 'Не задано Gemini API-ключ — конспект скасовано');
+      return;
+    }
+
+    const job = jobs[0]; // обробляємо послідовно: одна генерація за раз, решта чекає в черзі
     try {
       const file = await Gemini.geminiGetFile(job.geminiFileName, geminiApiKey);
 
       if (file.state === 'PROCESSING') {
-        job.ticks = (job.ticks || 0) + 1;
-        if (job.ticks >= GEMINI_MAX_TICKS) {
-          await finishGeminiJob('Конспект не вдалося зробити: тайм-аут обробки аудіо', false);
-        } else {
-          await chrome.storage.local.set({ geminiJob: job });
-        }
+        const ticks = (job.ticks || 0) + 1;
+        if (ticks >= GEMINI_MAX_TICKS) await finishJob(job, 'Конспект не вдалося зробити: тайм-аут обробки аудіо', false);
+        else await patchJob(job, { ticks });
         return;
       }
       if (file.state === 'FAILED') {
-        await finishGeminiJob('Конспект не вдалося зробити: Gemini не обробив аудіо', false);
+        await finishJob(job, 'Конспект не вдалося зробити: Gemini не обробив аудіо', false);
         return;
       }
 
@@ -173,10 +236,17 @@ async function pollGeminiJob() {
       if (truncated) MRLog.log('warn', 'gemini', 'Конспект міг обрізатися (finishReason: ' + finishReason + ')', { rec: job.meetingBaseName });
       let status = await saveDoc(job, text);
       if (truncated) status += ' (увага: конспект може бути неповним — ' + finishReason + ')';
-      await finishGeminiJob(status, !truncated);
+      await finishJob(job, status, !truncated);
     } catch (e) {
-      MRLog.log('error', 'gemini', e, { rec: job && job.meetingBaseName });
-      await finishGeminiJob('Конспект не вдалося зробити: ' + ((e && e.message) || e), false);
+      // Разова помилка мережі/503 не вбиває конспект — повторюємо наступними тиками.
+      const errors = (job.errors || 0) + 1;
+      const msg = (e && e.message) || String(e);
+      if (errors >= GEMINI_MAX_ERRORS) {
+        await finishJob(job, 'Конспект не вдалося зробити: ' + msg, false);
+      } else {
+        MRLog.log('warn', 'gemini', 'Спроба ' + errors + '/' + GEMINI_MAX_ERRORS + ' не вдалася, повторю за 30 с: ' + msg, { rec: job.meetingBaseName });
+        await patchJob(job, { errors });
+      }
     }
   } finally {
     geminiBusy = false;
@@ -198,10 +268,12 @@ async function saveDoc(job, text) {
   }
 }
 
-// ok=true → успіх (зелена нотифікація), false → провал/неповний конспект.
-async function finishGeminiJob(status, ok) {
-  await chrome.alarms.clear(GEMINI_ALARM);
-  await chrome.storage.local.remove('geminiJob');
-  setStatus(status);
-  notify(ok ? 'Конспект готовий' : 'Конспект: проблема', status);
-}
+// Страховка: chrome.alarms не гарантовано переживають перезапуск браузера. Якщо в черзі
+// лишилися конспекти (браузер закрили, поки вони робились) — переозброюємо alarm на
+// кожному старті SW; onStartup-слухач гарантує, що SW прокинеться на старті браузера.
+chrome.runtime.onStartup.addListener(() => { /* будить SW; переозброєння робить код нижче */ });
+chrome.storage.local.get(['geminiJobs', 'geminiJob']).then(({ geminiJobs, geminiJob }) => {
+  if ((Array.isArray(geminiJobs) && geminiJobs.length) || geminiJob) {
+    chrome.alarms.create(GEMINI_ALARM, { periodInMinutes: 0.5 });
+  }
+});

@@ -64,6 +64,16 @@
     return meta.id;
   }
 
+  // Оновити метадані сесії (напр. videoSaved після успішного аплоаду відео) — щоб
+  // відновлення знало, що лишився тільки конспект, і не дублювало відео в Drive.
+  async function updateSession(id, patch) {
+    await tx('recordings', 'readwrite', (t) => {
+      const store = t.objectStore('recordings');
+      const req = store.get(id);
+      req.onsuccess = () => { if (req.result) store.put({ ...req.result, ...patch }); };
+    });
+  }
+
   // Дописати шматок доріжки сесії id (на диск). kind: 'video' (типово) або 'audio'.
   async function appendChunk(id, blob, kind = 'video') {
     await tx('chunks', 'readwrite', (t) => {
@@ -116,5 +126,5 @@
     return stale.length;
   }
 
-  g.RecStore = { startSession, appendChunk, readBlob, countChunks, listOrphans, deleteSession, pruneOld };
+  g.RecStore = { startSession, updateSession, appendChunk, readBlob, countChunks, listOrphans, deleteSession, pruneOld };
 })(globalThis);
