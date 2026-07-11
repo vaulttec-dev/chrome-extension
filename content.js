@@ -168,6 +168,7 @@
       audioRecorder.start(1000);
 
       isRecording = true;
+      resetMeta(); // почати збір учасників і «хто говорить» для конспекту
       render();
       removeRecoveryBanner(); // йде новий запис — старий банер відновлення прибрати
       chrome.runtime.sendMessage({ target: 'bg', type: 'BADGE', on: true });
@@ -211,6 +212,12 @@
     render();
     chrome.runtime.sendMessage({ target: 'bg', type: 'BADGE', on: false });
 
+    // Імена учасників і шкала мовців — для конспекту (і в журнал, щоб пережили обрив).
+    const meta = buildMeetingMeta();
+    if (meta) MRLog.log('info', 'meta', 'Зібрано для конспекту: ' + meta.split('\n')[0].slice(0, 160) + (speakerSegs && speakerSegs.length ? ` | сегментів мовлення: ${speakerSegs.length}` : ' | шкали мовців немає'));
+    else MRLog.log('warn', 'meta', 'Учасників з DOM Meet зчитати не вдалося (розмітка змінилась?) — конспект піде без списку імен');
+    if (id && meta) await RecStore.updateSession(id, { meta }).catch(() => {});
+
     try {
       setStatus('Збереження…');
       const saved = await saveRecording(blob, name);
@@ -222,7 +229,7 @@
       // в Gemini: закриють вкладку під час аплоаду аудіо — конспект відновиться банером.
       if (id) await RecStore.updateSession(id, { videoSaved: true, folderId: saved.folderId || null })
         .catch((e2) => MRLog.log('warn', 'save', 'updateSession: ' + ((e2 && e2.message) || e2)));
-      const gemOk = await maybeGemini(audioBlob, name, saved.folderId); // ставить власні статуси
+      const gemOk = await maybeGemini(audioBlob, name, saved.folderId, meta); // ставить власні статуси
       if (id) {
         if (gemOk) await RecStore.deleteSession(id); // конспект у роботі або свідомо пропущено → журнал не потрібен
         else MRLog.log('warn', 'gemini', 'Аудіо не пішло в Gemini — сесія лишається, конспект можна повторити банером у Meet');
@@ -265,11 +272,120 @@
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
+  // ---- Учасники та «хто говорить» (з DOM Meet) ----
+  // Усе тут — best-effort евристики по розмітці Meet: якщо Google її змінить, збір просто
+  // поверне порожньо (конспект піде без імен), а в лог впаде попередження. Запису це не ламає.
+  let roster = null;       // participantId → { names: Map(ім'я → к-сть спостережень), self: bool }
+  let speakerSegs = null;  // сегменти мовлення [{s,e,id}] у секундах від старту запису
+  let openSegs = null;     // id → відкритий сегмент (для склеювання сусідніх секунд)
+  let recStartMs = 0;
+  let speakerOverflow = false;
+
+  function resetMeta() {
+    roster = new Map();
+    speakerSegs = [];
+    openSegs = {};
+    recStartMs = Date.now();
+    speakerOverflow = false;
+  }
+
+  // Тексти-кандидати на ім'я всередині плитки учасника.
+  function textCandidates(tile) {
+    const out = [];
+    const walker = document.createTreeWalker(tile, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = walker.nextNode())) {
+      const t = (n.textContent || '').trim();
+      if (t.length < 2 || t.length > 60) continue;
+      if (/^[a-z_0-9]+$/.test(t)) continue;            // лігатури material-іконок (mic_off тощо)
+      if (/\d{1,2}:\d{2}/.test(t)) continue;           // таймери
+      if (/презентац|presentation|демонстр/i.test(t)) continue;
+      out.push(t);
+    }
+    return out;
+  }
+
+  // «Плитка зараз говорить»: Meet анімує дрібний індикатор (звукові хвильки) — шукаємо
+  // маленький елемент із запущеною CSS-анімацією. Обмежуємо перебір, щоб не вантажити CPU.
+  function isSpeakingTile(tile) {
+    const els = tile.querySelectorAll('div,span,svg');
+    let checked = 0;
+    for (const el of els) {
+      const w = el.clientWidth, h = el.clientHeight;
+      if (!w || !h || w > 48 || h > 48) continue;
+      if (++checked > 60) break;
+      const st = getComputedStyle(el);
+      if (st.animationName && st.animationName !== 'none' && st.animationPlayState === 'running') return true;
+    }
+    return false;
+  }
+
+  // Один семпл на секунду під час запису: оновити імена і відкриті сегменти мовлення.
+  function sampleMeta() {
+    if (!roster) return;
+    try {
+      const selfEl = document.querySelector('[data-self-name]');
+      const selfName = selfEl ? selfEl.getAttribute('data-self-name') : null;
+      const tiles = document.querySelectorAll('[data-participant-id]');
+      if (!tiles.length || tiles.length > 60) return;
+      const nowSec = Math.round((Date.now() - recStartMs) / 1000);
+      const seenIds = new Set();
+      tiles.forEach((tile) => {
+        const id = tile.getAttribute('data-participant-id');
+        if (!id || seenIds.has(id)) return;
+        seenIds.add(id);
+        let rec = roster.get(id);
+        if (!rec) { rec = { names: new Map(), self: false }; roster.set(id, rec); }
+        for (const t of textCandidates(tile)) {
+          if (/^(ви|you|вы)$/i.test(t)) { rec.self = true; continue; }
+          rec.names.set(t, (rec.names.get(t) || 0) + 1);
+        }
+        if (selfName && rec.self) rec.names.set(selfName, (rec.names.get(selfName) || 0) + 1);
+        if (!speakerOverflow && isSpeakingTile(tile)) {
+          let g = openSegs[id];
+          if (g && nowSec - g.e <= 2) g.e = nowSec; // склеюємо паузи ≤2 с
+          else {
+            g = { s: nowSec, e: nowSec, id };
+            speakerSegs.push(g);
+            openSegs[id] = g;
+            if (speakerSegs.length > 1500) speakerOverflow = true; // дуже довга зустріч — далі лише імена
+          }
+        }
+      });
+    } catch (_) { /* збір метаданих ніколи не має ламати запис */ }
+  }
+
+  // Зібрати текстовий блок для промпту Gemini: список імен + шкала «хто коли говорив».
+  function buildMeetingMeta() {
+    if (!roster || !roster.size) return null;
+    const idName = new Map();
+    const people = [];
+    for (const [id, rec] of roster) {
+      let best = null, bestN = 0;
+      for (const [n, c] of rec.names) if (c > bestN) { best = n; bestN = c; }
+      if (!best || bestN < 2) continue; // випадкове сміття, бачене один раз
+      idName.set(id, best);
+      people.push(best + (rec.self ? ' (я — власник запису)' : ''));
+    }
+    const uniq = [...new Set(people)];
+    if (!uniq.length) return null;
+    let txt = 'Учасники зустрічі (імена з інтерфейсу Meet — вживай у конспекті ЛИШЕ їх): ' + uniq.join(', ') + '.';
+    const segs = (speakerSegs || []).filter((g) => idName.has(g.id) && g.e - g.s >= 2);
+    if (segs.length >= 3) {
+      const fmt = (s) => Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+      txt += '\nОрієнтовна шкала «хто коли говорив» (за індикатором Meet; похибка в кілька секунд, ' +
+        'звіряй із голосами та звертаннями в аудіо): ' +
+        segs.map((g) => `${fmt(g.s)}–${fmt(g.e)} ${idName.get(g.id)}`).join('; ') + '.';
+    }
+    return txt;
+  }
+
   // Якщо є Gemini-ключ — заливаємо АУДІО в Gemini (великий аплоад тут), далі
   // дрібну обробку (очікування → генерація → Google Doc) веде service worker.
   // Повертає true, коли повторювати нема чого (конспект запущено або свідомо пропущено),
   // і false, коли аплоад/передача не вдалися — тоді сесію в журналі варто лишити на повтор.
-  async function maybeGemini(audioBlob, name, folderId) {
+  // meta — блок «учасники + хто коли говорив» для промпту (може бути null).
+  async function maybeGemini(audioBlob, name, folderId, meta) {
     const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
     if (!geminiApiKey) { MRLog.log('info', 'gemini', 'Конспект пропущено: не задано Gemini-ключ'); return true; }
     // Свідомо шлемо ЛИШЕ аудіо-доріжку. Повне відео сюди слати не можна: години 720p —
@@ -291,7 +407,8 @@
           mimeType: file.mimeType,
           docName: baseName + ' — конспект',
           meetingBaseName: baseName,
-          folderId: folderId || null
+          folderId: folderId || null,
+          speakerContext: meta || null
         }
       });
       if (!r || !r.ok) throw new Error((r && r.error) || 'background не прийняв завдання');
@@ -404,7 +521,8 @@
       // Повне відео в Gemini НЕ шлемо (завелике → гарантований провал) — лише аудіо-доріжку.
       // Якщо її нема (стара сесія / запис без звуку) — maybeGemini чесно пропустить конспект.
       const audioBlob = await RecStore.readBlob(session.id, 'audio/webm', 'audio').catch(() => null);
-      const gemOk = await maybeGemini(audioBlob, name, folderId);
+      // Імена/шкала мовців збережені в сесії ще під час запису (тік раз на 30 с).
+      const gemOk = await maybeGemini(audioBlob, name, folderId, session.meta || null);
       if (gemOk) {
         await RecStore.deleteSession(session.id);
         initRecovery(); // якщо є ще незавершені сесії — одразу показати наступний банер
@@ -450,9 +568,19 @@
   });
 
   // Показ кнопки під час дзвінка + автозупинка на завершенні.
+  // Той самий тік раз на секунду семплить учасників/мовців і раз на 30 с
+  // персистить зібране в журнал — щоб імена пережили обрив і дісталися recovery.
+  let metaTick = 0;
   setInterval(() => {
     const onMeeting = inCall();
     if (onMeeting) ensureButton(); else removeButton();
+    if (isRecording) {
+      sampleMeta();
+      if (recId && (++metaTick % 30) === 0) {
+        const meta = buildMeetingMeta();
+        if (meta) RecStore.updateSession(recId, { meta }).catch(() => {});
+      }
+    }
     if (isRecording && (!onMeeting || leftCall())) stopCapture();
   }, 1000);
 

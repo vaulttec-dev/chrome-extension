@@ -231,7 +231,7 @@ async function pollGeminiJob() {
       }
 
       // ACTIVE → генеруємо конспект і кладемо у Drive (або локально .txt).
-      const { text, finishReason } = await Gemini.geminiGenerate(file.uri || job.fileUri, file.mimeType || job.mimeType, geminiApiKey);
+      const { text, finishReason } = await Gemini.geminiGenerate(file.uri || job.fileUri, file.mimeType || job.mimeType, geminiApiKey, job.speakerContext || null);
       const truncated = finishReason && finishReason !== 'STOP';
       if (truncated) MRLog.log('warn', 'gemini', 'Конспект міг обрізатися (finishReason: ' + finishReason + ')', { rec: job.meetingBaseName });
       let status = await saveDoc(job, text);
