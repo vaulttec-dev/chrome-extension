@@ -87,6 +87,31 @@
     else startCapture();
   }
 
+  // ---- Захист аплоаду від закриття вкладки ----
+  // Головна причина втрат записів (видно в логах 13–14.07): відео 1–2 ГБ вантажиться на
+  // Drive кілька хвилин, а вкладка закривається/переходить раніше. Тому на час збереження:
+  // (1) показуємо помітний банер, (2) вмикаємо beforeunload-діалог «покинути сторінку?».
+  let savingBusy = false;
+  let busyBanner = null;
+
+  function setSaving(on, text) {
+    savingBusy = on;
+    if (!on) { if (busyBanner) { busyBanner.remove(); busyBanner = null; } return; }
+    if (!busyBanner) {
+      busyBanner = document.createElement('div');
+      busyBanner.id = 'meet-rec-busy';
+      busyBanner.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);' +
+        'z-index:2147483647;background:#b3261e;color:#fff;padding:10px 18px;border-radius:8px;' +
+        'font:500 14px/1.3 "Google Sans",Roboto,sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.35)';
+      document.body.appendChild(busyBanner);
+    }
+    busyBanner.textContent = '⏳ ' + (text || 'Зберігаю запис — НЕ закривайте вкладку');
+  }
+
+  window.addEventListener('beforeunload', (e) => {
+    if (savingBusy) { e.preventDefault(); e.returnValue = ''; }
+  });
+
   // ---- Захоплення + запис ----
   async function startCapture() {
     if (recorder) return;
@@ -220,6 +245,7 @@
 
     try {
       setStatus('Збереження…');
+      setSaving(true, 'Зберігаю відео на Drive — НЕ закривайте вкладку (це може тривати кілька хвилин)');
       const saved = await saveRecording(blob, name);
       setStatus(saved.where === 'drive'
         ? 'Готово ✓ — збережено в Google Drive'
@@ -239,6 +265,7 @@
       MRLog.log('error', 'save', 'Помилка збереження (запис лишається для відновлення): ' + ((e && e.message) || e));
       setStatus('Помилка збереження: ' + ((e && e.message) || e));
     } finally {
+      setSaving(false);
       recorder = null;
       chunks = [];
       audioRecorder = null;
@@ -300,6 +327,8 @@
       if (/^[a-z_0-9]+$/.test(t)) continue;            // лігатури material-іконок (mic_off тощо)
       if (/\d{1,2}:\d{2}/.test(t)) continue;           // таймери
       if (/презентац|presentation|демонстр/i.test(t)) continue;
+      // тексти кнопок/меню Meet, що просочуються у плитки (бачили в логах «Більше варіант…»)
+      if (/більше|вилучити|закріпити|відкріпити|вимкнути|увімкнути|додати|варіант|повідомл|реакці|мікрофон|камер|звук$|аудіо|відео|дзвін|розмов|учасник|pin|unpin|remove|mute|option|more|call/i.test(t)) continue;
       out.push(t);
     }
     return out;
@@ -398,6 +427,7 @@
     const baseName = name.replace(/\.webm$/i, '');
     try {
       setStatus('Готую конспект (надсилаю аудіо в Gemini)…');
+      setSaving(true, 'Надсилаю аудіо для конспекту — НЕ закривайте вкладку');
       const file = await Gemini.geminiUploadFile(audioBlob, geminiApiKey, 'audio/webm');
       const r = await sendBg({
         type: 'GEMINI_CONTINUE',
@@ -487,6 +517,7 @@
   async function recover(session, toDrive) {
     removeRecoveryBanner();
     try {
+      setSaving(true, 'Відновлюю запис — НЕ закривайте вкладку (це може тривати кілька хвилин)');
       MRLog.log('info', 'recovery', 'Відновлення (' + (session.videoSaved ? 'лише конспект' : toDrive ? 'на Drive' : 'локально') + '): ' + (session.name || session.id));
       const name = session.name || `Meet ${session.code ? session.code + ' ' : ''}recovered.webm`;
       let folderId = session.folderId || null;
@@ -535,6 +566,8 @@
       MRLog.log('error', 'recovery', 'Відновлення не вдалося (запис лишається): ' + ((e && e.message) || e));
       setStatus('Відновлення не вдалося: ' + ((e && e.message) || e));
       showRecoveryBanner(session);
+    } finally {
+      setSaving(false);
     }
   }
 
