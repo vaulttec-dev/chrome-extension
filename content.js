@@ -246,7 +246,7 @@
     try {
       setStatus('Збереження…');
       setSaving(true, 'Зберігаю відео на Drive — НЕ закривайте вкладку (це може тривати кілька хвилин)');
-      const saved = await saveRecording(blob, name);
+      const saved = await saveRecording(blob, name, { id });
       setStatus(saved.where === 'drive'
         ? 'Готово ✓ — збережено в Google Drive'
         : 'Готово ✓ — збережено локально (тека «Завантаження»)');
@@ -276,10 +276,23 @@
   }
 
   // Спершу Drive (великий аплоад прямо звідси); якщо не вдалося — локально.
-  async function saveRecording(blob, name) {
+  // resumeCtx = { id, uploadUrl, folderId }: id сесії журналу (туди зберігається
+  // resumable-сесія Drive одразу після створення) та, за наявності, сесія попередньої
+  // спроби — тоді аплоад продовжується з байта, на якому обірвався, а не з нуля.
+  async function saveRecording(blob, name, resumeCtx) {
+    let sessUrl = (resumeCtx && resumeCtx.uploadUrl) || null;
+    let sessFolder = (resumeCtx && resumeCtx.folderId) || null;
     try {
-      const { folderId } = await withToken((token) => GDrive.uploadResumable(token, blob, name));
-      return { where: 'drive', folderId };
+      const { folderId } = await withToken((token) => GDrive.uploadResumable(token, blob, name, {
+        uploadUrl: sessUrl,
+        folderId: sessFolder,
+        onSession: (u, f) => {
+          sessUrl = u; sessFolder = f;
+          if (resumeCtx && resumeCtx.id) RecStore.updateSession(resumeCtx.id, { uploadUrl: u, folderId: f }).catch(() => {});
+        },
+        onProgress: (pct) => setSaving(true, `Зберігаю відео на Drive: ${pct}% — НЕ закривайте вкладку`)
+      }));
+      return { where: 'drive', folderId: folderId || sessFolder };
     } catch (driveErr) {
       MRLog.log('warn', 'save', 'Drive недоступний, зберігаю локально: ' + ((driveErr && driveErr.message) || driveErr));
       downloadLocally(blob, name);
@@ -458,8 +471,17 @@
       await RecStore.pruneOld();
       const orphans = await RecStore.listOrphans();
       if (orphans.length && !isRecording) {
-        MRLog.log('info', 'recovery', 'Знайдено незавершений запис: ' + (orphans[0].name || orphans[0].id));
-        showRecoveryBanner(orphans[0]);
+        const s = orphans[0];
+        if (s.videoSaved || s.uploadUrl) {
+          // Збереження вже почалося (або відео вже в Drive, лишився конспект) —
+          // доводимо до кінця САМІ, без кліків: аплоад продовжиться з місця обриву.
+          MRLog.log('info', 'recovery', 'Авто-продовження збереження: ' + (s.name || s.id));
+          recover(s, true);
+        } else {
+          // Обрив ще ДО початку збереження (крах посеред запису) — тут лишаємо вибір людині.
+          MRLog.log('info', 'recovery', 'Знайдено незавершений запис: ' + (s.name || s.id));
+          showRecoveryBanner(s);
+        }
       }
     } catch (e) {
       MRLog.log('warn', 'recovery', 'Помилка ініціалізації відновлення: ' + ((e && e.message) || e));
@@ -514,8 +536,17 @@
     } catch (e) { MRLog.log('warn', 'recovery', 'Не вдалося видалити сесію: ' + ((e && e.message) || e)); }
   }
 
+  // Обгортка: дві вкладки Meet не мають лити той самий запис одночасно —
+  // Web Locks працюють між вкладками одного origin, зайва вкладка просто пропустить.
   async function recover(session, toDrive) {
     removeRecoveryBanner();
+    return navigator.locks.request('meetrec-recover-' + session.id, { ifAvailable: true }, async (lock) => {
+      if (!lock) { MRLog.log('info', 'recovery', 'Пропущено: цей запис уже відновлює інша вкладка'); return; }
+      await doRecover(session, toDrive);
+    });
+  }
+
+  async function doRecover(session, toDrive) {
     try {
       setSaving(true, 'Відновлюю запис — НЕ закривайте вкладку (це може тривати кілька хвилин)');
       MRLog.log('info', 'recovery', 'Відновлення (' + (session.videoSaved ? 'лише конспект' : toDrive ? 'на Drive' : 'локально') + '): ' + (session.name || session.id));
@@ -532,7 +563,7 @@
           return;
         }
         if (toDrive) {
-          const saved = await saveRecording(blob, name);
+          const saved = await saveRecording(blob, name, { id: session.id, uploadUrl: session.uploadUrl || null, folderId: session.folderId || null });
           folderId = saved.folderId || null;
           setStatus(saved.where === 'drive'
             ? 'Відновлено ✓ — збережено в Google Drive'

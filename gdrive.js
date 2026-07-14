@@ -45,30 +45,73 @@
     return getOrCreateFolder(token, baseName, parent);
   }
 
-  // Залити blob у теку зустрічі (resumable upload, бо відео часто > 5 МБ —
-  // ліміту multipart). Повертає { fileId, folderId }: folderId переюзається
-  // для конспекту, щоб service worker не шукав теку вдруге.
-  async function uploadResumable(token, blob, name) {
-    const folderId = await getMeetingFolderId(token, name.replace(/\.webm$/i, ''));
+  // Залити blob у теку зустрічі шматками по 32 МіБ через resumable-сесію Drive.
+  // Головне: сесія (uploadUrl) переживає обрив вкладки — наступна спроба продовжує
+  // з байта, на якому зупинились (сесія Drive живе ~тиждень), а не з нуля.
+  // opts = { uploadUrl?, folderId?, onSession?(uploadUrl, folderId), onProgress?(pct) }:
+  //   uploadUrl/folderId — сесія попередньої спроби (з журналу запису);
+  //   onSession — кличеться одразу після створення сесії, щоб зберегти її в журнал;
+  //   onProgress — відсоток залитого, для банера.
+  const UPLOAD_CHUNK = 32 * 1024 * 1024; // кратно 256 КіБ — вимога протоколу Drive
 
-    const init = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, parents: [folderId] })
-    });
-    if (!init.ok) throw httpError('init', init.status);
+  async function uploadResumable(token, blob, name, opts) {
+    const o = opts || {};
+    let folderId = o.folderId || null;
+    let uploadUrl = o.uploadUrl || null;
+    let offset = 0;
 
-    const uploadUrl = init.headers.get('Location');
-    if (!uploadUrl) throw new Error('no upload url'); // Location не дійшов (CORS?) → фолбек локально
+    if (uploadUrl) {
+      // Скільки байтів сесія вже прийняла? 308 → продовжуємо; 2xx → усе вже залито
+      // минулого разу; інше (404/410) → сесія померла, починаємо нову.
+      const probe = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers: { 'Content-Range': `bytes */${blob.size}` }
+      });
+      if (probe.status === 308) {
+        const range = probe.headers.get('Range'); // "bytes=0-N" або нічого (0 байт)
+        offset = range ? parseInt(range.split('-')[1], 10) + 1 : 0;
+      } else if (probe.ok) {
+        const file = await probe.json();
+        return { fileId: file.id, folderId };
+      } else {
+        uploadUrl = null;
+      }
+    }
 
-    const put = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'video/webm' },
-      body: blob
-    });
-    if (!put.ok) throw httpError('put', put.status);
-    const file = await put.json();
-    return { fileId: file.id, folderId };
+    if (!uploadUrl) {
+      if (!folderId) folderId = await getMeetingFolderId(token, name.replace(/\.webm$/i, ''));
+      const init = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, parents: [folderId] })
+      });
+      if (!init.ok) throw httpError('init', init.status);
+      uploadUrl = init.headers.get('Location');
+      if (!uploadUrl) throw new Error('no upload url'); // Location не дійшов (CORS?) → фолбек локально
+      offset = 0;
+      if (o.onSession) try { o.onSession(uploadUrl, folderId); } catch (_) {}
+    }
+
+    while (offset < blob.size) {
+      const end = Math.min(offset + UPLOAD_CHUNK, blob.size);
+      const put = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers: { 'Content-Range': `bytes ${offset}-${end - 1}/${blob.size}` },
+        body: blob.slice(offset, end)
+      });
+      if (put.status === 308) {
+        const range = put.headers.get('Range');
+        offset = range ? parseInt(range.split('-')[1], 10) + 1 : end;
+      } else if (put.ok) {
+        if (o.onProgress) try { o.onProgress(100); } catch (_) {}
+        const file = await put.json();
+        return { fileId: file.id, folderId };
+      } else {
+        throw httpError('put', put.status);
+      }
+      if (o.onProgress) try { o.onProgress(Math.round((offset / blob.size) * 100)); } catch (_) {}
+    }
+    throw new Error('upload не завершився'); // останній шматок мав повернути 2xx
   }
 
   // Створити Google Doc із конспекту в теці folderId (multipart → конвертація з markdown).
