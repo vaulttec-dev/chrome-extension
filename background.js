@@ -6,6 +6,9 @@ importScripts('logstore.js', 'gdrive.js', 'gemini.js');
 const GEMINI_ALARM = 'geminiPoll';
 const GEMINI_MAX_TICKS = 60; // ~30 хв при періоді 0.5 хв — багатогодинне аудіо довго в стані PROCESSING
 const GEMINI_MAX_ERRORS = 8; // ~4 хв повторів — разовий збій мережі чи 503 від Gemini не вбиває конспект
+// Додаток до промпту при повторі після обрізання (MAX_TOKENS) — вимагаємо стисліший формат.
+const CONCISE_HINT = '\n\nВАЖЛИВО: попередня спроба конспекту вийшла надто довгою і обірвалася по ліміту. ' +
+  'Цього разу пиши значно стисліше: синтез по темах, БЕЗ цитування окремих реплік і БЕЗ таймкодів.';
 
 function setStatus(text) {
   chrome.storage.local.set({ lastStatus: text });
@@ -124,6 +127,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         .then(() => sendResponse({ ok: true }))
         .catch((e) => sendResponse({ ok: false, error: e.message }));
       return true;
+
+    case 'GEMINI_REDO':
+      // Кнопка «Повторити конспект» у popup: перезапустити останній job зі стислішим
+      // форматом. Працює, поки аудіо-файл живе в Gemini (~48 год після зустрічі).
+      chrome.storage.local.get('lastGeminiJob').then(({ lastGeminiJob }) => {
+        if (!lastGeminiJob) { sendResponse({ ok: false, error: 'немає попереднього конспекту' }); return; }
+        startGeminiJob({ ...lastGeminiJob, retryConcise: true })
+          .then(() => sendResponse({ ok: true }))
+          .catch((e) => sendResponse({ ok: false, error: e.message }));
+      });
+      return true;
   }
 });
 
@@ -168,10 +182,12 @@ function patchJob(job, patch) {
 }
 
 // Прибрати завдання з черги + статус і нотифікація; alarm гасимо, лише коли черга порожня.
+// Останній job лишаємо в lastGeminiJob — кнопка «Повторити конспект» у popup перезапускає
+// його, поки аудіо живе в Gemini (~48 год): рятує обрізані/невдалі конспекти без перезапису.
 async function finishJob(job, status, ok) {
   await withQueue(async () => {
     const jobs = (await readQueue()).filter((j) => !sameJob(j, job));
-    await chrome.storage.local.set({ geminiJobs: jobs });
+    await chrome.storage.local.set({ geminiJobs: jobs, lastGeminiJob: { ...job, ticks: 0, errors: 0 } });
     if (!jobs.length) await chrome.alarms.clear(GEMINI_ALARM);
   });
   MRLog.log(ok ? 'info' : 'error', 'gemini', status, { rec: job.meetingBaseName });
@@ -231,9 +247,17 @@ async function pollGeminiJob() {
       }
 
       // ACTIVE → генеруємо конспект і кладемо у Drive (або локально .txt).
-      const { text, finishReason } = await Gemini.geminiGenerate(file.uri || job.fileUri, file.mimeType || job.mimeType, geminiApiKey, job.speakerContext || null);
+      const ctx = ((job.speakerContext || '') + (job.retryConcise ? CONCISE_HINT : '')) || null;
+      const { text, finishReason } = await Gemini.geminiGenerate(file.uri || job.fileUri, file.mimeType || job.mimeType, geminiApiKey, ctx);
       const truncated = finishReason && finishReason !== 'STOP';
-      if (truncated) MRLog.log('warn', 'gemini', 'Конспект міг обрізатися (finishReason: ' + finishReason + ')', { rec: job.meetingBaseName });
+      if (truncated && !job.retryConcise) {
+        // Обрізалося по ліміту → НЕ зберігаємо огризок, а автоматично повторюємо
+        // наступним тиком зі стислішим форматом (одна повторна спроба).
+        MRLog.log('warn', 'gemini', 'Конспект обрізано (' + finishReason + ') — автоматично повторюю стисліше', { rec: job.meetingBaseName });
+        await patchJob(job, { retryConcise: true });
+        return;
+      }
+      if (truncated) MRLog.log('warn', 'gemini', 'Конспект знову обрізано (' + finishReason + ') — зберігаю як є', { rec: job.meetingBaseName });
       let status = await saveDoc(job, text);
       if (truncated) status += ' (увага: конспект може бути неповним — ' + finishReason + ')';
       await finishJob(job, status, !truncated);
@@ -276,4 +300,15 @@ chrome.storage.local.get(['geminiJobs', 'geminiJob']).then(({ geminiJobs, gemini
   if ((Array.isArray(geminiJobs) && geminiJobs.length) || geminiJob) {
     chrome.alarms.create(GEMINI_ALARM, { periodInMinutes: 0.5 });
   }
+});
+
+// Одноразовий порятунок: якщо lastGeminiJob порожній, підхопити його з seed-файла
+// (метадані обрізаного конспекту 15.07 — щоб кнопка «Повторити конспект» його врятувала).
+// Після успішного повтору файл seed-lastjob.json можна видалити з теки розширення.
+chrome.storage.local.get('lastGeminiJob').then(async ({ lastGeminiJob }) => {
+  if (lastGeminiJob) return;
+  try {
+    const r = await fetch(chrome.runtime.getURL('seed-lastjob.json'));
+    if (r.ok) await chrome.storage.local.set({ lastGeminiJob: await r.json() });
+  } catch (_) { /* seed нема — і не треба */ }
 });

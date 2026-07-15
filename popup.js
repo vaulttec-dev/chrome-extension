@@ -46,6 +46,28 @@ saveKeyBtn.addEventListener('click', () => {
   });
 });
 
+// ---- Повторити останній конспект (поки аудіо живе в Gemini, ~48 год) ----
+const redoBtn = document.getElementById('redo');
+const redoHint = document.getElementById('redohint');
+
+function renderRedo(lastGeminiJob) {
+  redoBtn.disabled = !lastGeminiJob;
+  redoHint.textContent = lastGeminiJob
+    ? 'Останній: ' + (lastGeminiJob.docName || '') + ' (діє ~48 год після зустрічі)'
+    : '';
+}
+chrome.storage.local.get('lastGeminiJob').then(({ lastGeminiJob }) => renderRedo(lastGeminiJob));
+
+redoBtn.addEventListener('click', () => {
+  redoBtn.disabled = true;
+  chrome.runtime.sendMessage({ target: 'bg', type: 'GEMINI_REDO' }, (r) => {
+    redoHint.textContent = r && r.ok
+      ? 'Конспект перезапущено — результат буде в тій самій теці Drive.'
+      : 'Не вдалося: ' + ((r && r.error) || 'невідома помилка');
+    redoBtn.disabled = false;
+  });
+});
+
 // ---- Історія (персистентний лог) ----
 const logEl = document.getElementById('log');
 const clearLogBtn = document.getElementById('clearlog');
