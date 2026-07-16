@@ -3,7 +3,7 @@
   "name": "Запис Meet → Drive",
   "version": "1.0.0",
   "description": "Запис дзвінка Google Meet однією кнопкою з автозавантаженням у Google Drive.",
-  "permissions": ["identity", "storage", "downloads", "alarms", "notifications"],
+  "permissions": ["identity", "storage", "downloads", "alarms", "notifications", "offscreen", "clipboardWrite"],
   "host_permissions": [
     "https://www.googleapis.com/*",
     "https://generativelanguage.googleapis.com/*"
@@ -14,9 +14,21 @@
       "js": ["logstore.js", "recstore.js", "gdrive.js", "gemini.js", "content.js"],
       "css": ["content.css"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["dictation.js"],
+      "css": ["dictation.css"],
+      "run_at": "document_idle"
     }
   ],
   "background": { "service_worker": "background.js" },
+  "commands": {
+    "toggle-dictation": {
+      "suggested_key": { "default": "Alt+Q" },
+      "description": "Диктування: старт / стоп"
+    }
+  },
   "action": { "default_popup": "popup.html", "default_title": "Запис Meet → Drive" },
   "oauth2": {
     "client_id": "243685062523-97p5q241td788vskivo4hspn7tugkh8i.apps.googleusercontent.com",

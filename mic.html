@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="utf-8" />
+    <title>Доступ до мікрофона</title>
+    <style>
+      body { font: 15px/1.5 Roboto, system-ui, sans-serif; color: #202124; max-width: 420px; margin: 60px auto; padding: 0 20px; }
+      h1 { font-size: 18px; }
+      #state { margin-top: 16px; padding: 12px; border-radius: 8px; background: #f1f3f4; }
+      .ok { background: #e6f4ea !important; color: #137333; }
+      .err { background: #fce8e6 !important; color: #c5221f; }
+    </style>
+  </head>
+  <body>
+    <h1>🎤 Доступ до мікрофона</h1>
+    <p>Розширенню потрібен доступ до мікрофона, щоб диктувати на будь-якому сайті.
+       Натисніть «Дозволити» у запиті браузера — це робиться <b>один раз</b>.</p>
+    <div id="state">Запитую дозвіл…</div>
+    <script src="mic.js"></script>
+  </body>
+</html>

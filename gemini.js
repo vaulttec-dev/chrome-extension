@@ -125,5 +125,54 @@
     return { text, finishReason };
   }
 
-  g.Gemini = { GEMINI_MODEL, GEMINI_PROMPT, geminiUploadFile, geminiGetFile, geminiGenerate };
+  // ---- Диктофон: дослівна транскрипція короткого аудіо ----
+  const GEMINI_TRANSCRIBE_PROMPT = `Розшифруй це аудіо у звичайний текст.
+Поверни ВИКЛЮЧНО дослівний транскрипт сказаного тією ж мовою, якою говорять
+(українською — українською). Без жодних коментарів, заголовків, лапок чи пояснень.
+Розстав природну пунктуацію та великі літери. Прибери слова-паразити й повтори-запинки
+лише якщо вони явно випадкові. Якщо мовлення немає — поверни порожній рядок.`;
+
+  // Короткий аудіоблоб → дослівний текст. Через Files API (той самий надійний шлях,
+  // що й конспект): resumable-аплоад → коротке очікування ACTIVE → generate.
+  // onWait — необовʼязковий колбек статусу (напр., щоб оновити тост «обробка…»).
+  async function geminiTranscribe(blob, key, onWait) {
+    const mime = (blob.type || 'audio/webm').split(';')[0];
+    let file = await geminiUploadFile(blob, key, mime);
+
+    // Аудіо зазвичай стає ACTIVE майже одразу; чекаємо максимум ~30 с.
+    for (let i = 0; i < 30 && file.state === 'PROCESSING'; i++) {
+      if (onWait) onWait(i);
+      await new Promise((res) => setTimeout(res, 1000));
+      file = await geminiGetFile(file.name, key);
+    }
+    if (file.state === 'FAILED') throw new Error('Gemini не зміг обробити аудіо');
+    if (file.state === 'PROCESSING') throw new Error('Gemini надто довго обробляє аудіо');
+
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: 'POST',
+        headers: { 'x-goog-api-key': key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { file_data: { mime_type: mime, file_uri: file.uri } },
+              { text: GEMINI_TRANSCRIBE_PROMPT }
+            ]
+          }],
+          generationConfig: { temperature: 0.2, maxOutputTokens: 8192 }
+        })
+      }
+    );
+    if (!r.ok) {
+      const t = await r.text().catch(() => '');
+      throw new Error('gemini transcribe ' + r.status + ' ' + t.slice(0, 200));
+    }
+    const d = await r.json();
+    const cand = d && d.candidates && d.candidates[0];
+    const parts = cand && cand.content && cand.content.parts;
+    return parts ? parts.map((p) => p.text).filter(Boolean).join('\n').trim() : '';
+  }
+
+  g.Gemini = { GEMINI_MODEL, GEMINI_PROMPT, geminiUploadFile, geminiGetFile, geminiGenerate, geminiTranscribe };
 })(globalThis);
