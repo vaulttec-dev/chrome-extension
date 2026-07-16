@@ -60,47 +60,48 @@
     });
   }
 
-  async function start() {
-    setState('recording');
-    showToast('● Запис… говоріть. Натисніть ще раз, щоб зупинити.', 0);
-    // START через service worker: лише він може створити offscreen-документ.
-    const res = await send({ target: 'bg', type: 'DICT_START' }, 15000);
+  // Стан запису — ЄДИНИЙ у background (offscreen один на все розширення). Кнопка лише
+  // просить background перемкнути й показує результат. Так неможливо запустити другий
+  // getUserMedia з іншої вкладки й накопичити «зомбі-мікрофони».
+  let busy = false;
+
+  async function toggle() {
+    if (busy) return; // не даємо накластися двом запитам toggle
+    busy = true;
+    // Оптимістично показуємо проміжний стан за локальним відображенням.
+    const wasRecording = state === 'recording';
+    if (wasRecording) { setState('busy'); showToast('Розшифровую через Gemini…', 0); }
+    else { setState('recording'); showToast('● Запис… говоріть. Натисніть ще раз, щоб зупинити.', 0); }
+
+    let key;
+    try { ({ geminiApiKey: key } = await chrome.storage.local.get('geminiApiKey')); } catch (_) { /* undefined */ }
+
+    const res = await send({ target: 'bg', type: 'DICT_TOGGLE', key }, 90000);
+    busy = false;
+
     if (!res || !res.ok) {
       setState('idle');
-      if (res && res.code === 'mic') {
-        showToast('Надайте доступ до мікрофона у вкладці, що відкрилась, потім спробуйте знову.', 5000);
-      } else {
-        showToast('Не вдалося почати: ' + ((res && res.error) || 'невідома помилка'), 4000);
-      }
+      if (res && res.code === 'mic') showToast('Надайте доступ до мікрофона у вкладці, що відкрилась, потім спробуйте знову.', 5000);
+      else showToast('Помилка: ' + ((res && res.error) || 'невідома помилка'), 5000);
+      return;
     }
-  }
-
-  async function stop() {
-    setState('busy');
-    showToast('Розшифровую через Gemini…', 0);
-    // Ключ читаємо тут (content має chrome.storage) і передаємо в offscreen — там storage немає.
-    let key;
-    try { ({ geminiApiKey: key } = await chrome.storage.local.get('geminiApiKey')); } catch (_) { /* ключ лишиться undefined */ }
-    // STOP — НАПРЯМУ до offscreen (повз SW): аплоад+обробка можуть тривати, а SW засинає.
-    const res = await send({ target: 'offscreen', type: 'stop', key }, 90000);
-    setState('idle');
-    if (res && res.ok) {
+    if (res.recording) {
+      setState('recording');
+      showToast('● Запис… говоріть. Натисніть ще раз, щоб зупинити.', 0);
+    } else {
+      setState('idle');
       if (res.text) showToast('✓ Скопійовано в буфер (' + res.text.length + ' символів). Вставте: Ctrl+V');
       else showToast('Порожньо — мовлення не розпізнано.');
-    } else {
-      showToast('Помилка: ' + ((res && res.error) || 'невідома помилка'), 5000);
     }
-  }
-
-  function toggle() {
-    if (state === 'idle') start();
-    else if (state === 'recording') stop();
   }
 
   btn.addEventListener('click', toggle);
 
-  // Гаряча клавіша (chrome.commands → background → сюди).
   chrome.runtime.onMessage.addListener((msg) => {
-    if (msg && msg.target === 'content' && msg.type === 'DICT_TOGGLE') toggle();
+    if (!msg || msg.target !== 'content') return;
+    // Гаряча клавіша (chrome.commands → background → сюди).
+    if (msg.type === 'DICT_TOGGLE') toggle();
+    // Синхронізація стану між вкладками (broadcast із background).
+    else if (msg.type === 'DICT_STATE' && !busy) setState(msg.recording ? 'recording' : 'idle');
   });
 })();

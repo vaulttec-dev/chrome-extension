@@ -74,9 +74,14 @@ function download(url, filename) {
   });
 }
 
-// ---- Offscreen-документ для диктофона (мікрофон + Gemini + буфер) ----
-// Content script не має доступу до chrome.offscreen, тож документ створює тут SW.
+// ---- Диктофон: offscreen (мікрофон + Gemini + буфер) з ЄДИНИМ станом у SW ----
+// Content script не має доступу до chrome.offscreen, тож документ створює/закриває SW.
+// Стан запису — у storage (storage.local.dictRecording), щоб пережити засинання SW під
+// час довгого запису. offscreen один на все розширення, тож другий getUserMedia неможливий,
+// поки йде запис (жодних «зомбі-мікрофонів»).
+let dictBusy = false; // серіалізуємо toggle, щоб клік+клавіша не наклалися
 let offscreenCreating = null;
+
 async function ensureOffscreen() {
   const ctxs = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
   if (ctxs.length) return;
@@ -88,6 +93,70 @@ async function ensureOffscreen() {
     }).finally(() => { offscreenCreating = null; });
   }
   await offscreenCreating;
+}
+
+async function closeOffscreen() {
+  try {
+    const ctxs = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+    if (ctxs.length) await chrome.offscreen.closeDocument();
+  } catch (_) { /* уже закритий */ }
+}
+
+// Синхронізуємо вигляд кнопки в усіх вкладках (запис могли зупинити з іншої вкладки/клавішею).
+function broadcastDict(recording) {
+  chrome.tabs.query({}, (tabs) => {
+    for (const t of tabs) {
+      if (t.id != null) chrome.tabs.sendMessage(t.id, { target: 'content', type: 'DICT_STATE', recording }, () => void chrome.runtime.lastError);
+    }
+  });
+}
+
+async function handleDictToggle(msg, sendResponse) {
+  if (dictBusy) { sendResponse({ ok: false, error: 'зачекайте — обробляю попередню дію' }); return; }
+  dictBusy = true;
+  try {
+    const { dictRecording } = await chrome.storage.local.get('dictRecording');
+    if (!dictRecording) {
+      // ---- СТАРТ ----
+      const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
+      if (!geminiApiKey) { sendResponse({ ok: false, error: 'Немає Gemini API-ключа — додайте його в попапі розширення.' }); return; }
+      await ensureOffscreen();
+      const res = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'start' });
+      if (res && res.ok) {
+        await chrome.storage.local.set({ dictRecording: true });
+        broadcastDict(true);
+        sendResponse({ ok: true, recording: true });
+      } else {
+        if (res && res.code === 'mic') chrome.tabs.create({ url: chrome.runtime.getURL('mic.html') });
+        await closeOffscreen();
+        sendResponse({ ok: false, code: res && res.code, error: (res && res.error) || 'не вдалося почати запис' });
+      }
+    } else {
+      // ---- СТОП + транскрипція. Мікрофон звільняє САМ offscreen через track.stop()
+      // (як роблять Zed/VS Code). Документ НЕ закриваємо: закриття offscreen лишає
+      // застряглі privacy-іконки в COSMIC. Idle-документ без активного треку індикатора не дає.
+      let res;
+      try { res = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'stop', key: msg.key }); }
+      catch (e) { res = { ok: false, error: e.message }; }
+      await chrome.storage.local.set({ dictRecording: false });
+      broadcastDict(false);
+      if (res && res.ok) {
+        MRLog.log('info', 'dict', res.text ? ('Транскрипт скопійовано (' + res.text.length + ' симв.)') : 'Порожньо — мовлення не розпізнано');
+        sendResponse({ ok: true, recording: false, text: res.text });
+      } else {
+        MRLog.log('error', 'dict', (res && res.error) || 'offscreen не відповів');
+        sendResponse({ ok: false, recording: false, error: (res && res.error) || 'помилка транскрипції' });
+      }
+    }
+  } catch (e) {
+    // Offscreen НЕ закриваємо: постійний потік мікрофона = одна стабільна трей-іконка
+    // (часті open/close засмічують трей COSMIC мертвими записами).
+    await chrome.storage.local.set({ dictRecording: false }).catch(() => {});
+    broadcastDict(false);
+    sendResponse({ ok: false, error: e.message });
+  } finally {
+    dictBusy = false;
+  }
 }
 
 // ---- Повідомлення ----
@@ -137,42 +206,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       })();
       return true;
 
-    case 'DICT_START':
-      (async () => {
-        try {
-          const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
-          if (!geminiApiKey) {
-            sendResponse({ ok: false, error: 'Немає Gemini API-ключа — додайте його в попапі розширення.' });
-            return;
-          }
-          await ensureOffscreen();
-          const res = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'start' });
-          if (res && res.code === 'mic') {
-            // Дозволу на мікрофон ще нема — відкриваємо видиму вкладку для одноразового запиту.
-            chrome.tabs.create({ url: chrome.runtime.getURL('mic.html') });
-          }
-          sendResponse(res || { ok: false, error: 'offscreen не відповів' });
-        } catch (e) {
-          sendResponse({ ok: false, error: e.message });
-        }
-      })();
-      return true;
-
-    case 'DICT_STOP':
-      (async () => {
-        try {
-          const res = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'stop' });
-          if (res && res.ok) {
-            MRLog.log('info', 'dict', res.text ? ('Транскрипт скопійовано (' + res.text.length + ' симв.)') : 'Порожньо — мовлення не розпізнано');
-          } else {
-            MRLog.log('error', 'dict', (res && res.error) || 'offscreen не відповів');
-          }
-          sendResponse(res || { ok: false, error: 'offscreen не відповів' });
-        } catch (e) {
-          MRLog.log('error', 'dict', e.message);
-          sendResponse({ ok: false, error: e.message });
-        }
-      })();
+    case 'DICT_TOGGLE':
+      handleDictToggle(msg, sendResponse);
       return true;
 
     case 'GEMINI_CONTINUE':
@@ -361,6 +396,10 @@ chrome.commands.onCommand.addListener((command) => {
 });
 
 chrome.runtime.onStartup.addListener(() => { /* будить SW; переозброєння робить код нижче */ });
+// Скидаємо стан диктофона на старті SW: перезавантаження розширення знищує offscreen-документ.
+chrome.storage.local.set({ dictRecording: false });
+closeOffscreen();
+
 chrome.storage.local.get(['geminiJobs', 'geminiJob']).then(({ geminiJobs, geminiJob }) => {
   if ((Array.isArray(geminiJobs) && geminiJobs.length) || geminiJob) {
     chrome.alarms.create(GEMINI_ALARM, { periodInMinutes: 0.5 });

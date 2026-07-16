@@ -22,19 +22,27 @@
     return ok;
   }
 
-  function cleanupStream() {
-    if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  // Потік мікрофона тримаємо ПОСТІЙНО (не закриваємо між записами): Chrome на Linux
+  // реєструє трей-іконку на КОЖНЕ нове захоплення, а watcher COSMIC не чистить мертві
+  // записи — часті open/close засмічували системний трей «фантомними» мікрофонами.
+  // Один постійний потік = одна стабільна іконка. Між записами трек вимкнено
+  // (enabled=false) — аудіо не пишеться й не обробляється.
+  async function ensureStream() {
+    if (stream && stream.getTracks().some((t) => t.readyState === 'live')) return stream;
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    return stream;
   }
 
   async function start() {
     if (recorder && recorder.state === 'recording') return { ok: true };
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      await ensureStream();
     } catch (e) {
-      cleanupStream();
+      stream = null;
       const denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
       return { ok: false, code: denied ? 'mic' : 'other', error: (e && e.message) || String(e) };
     }
+    stream.getTracks().forEach((t) => { t.enabled = true; });
     chunks = [];
     mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus'
@@ -56,7 +64,8 @@
       if (rec.state !== 'inactive') rec.stop();
       else resolve(new Blob(chunks, { type: mimeType }));
     });
-    cleanupStream();
+    // Потік НЕ закриваємо (див. коментар вище) — лише вимикаємо трек до наступного запису.
+    if (stream) stream.getTracks().forEach((t) => { t.enabled = false; });
 
     if (!blob.size) return { ok: true, text: '' };
     if (!key) return { ok: false, error: 'немає Gemini API-ключа' };
@@ -71,12 +80,18 @@
     return { ok: true, text };
   }
 
-  // Завжди відповідаємо (навіть на reject), інакше відправник висить назавжди.
-  const fail = (sendResponse) => (e) => sendResponse({ ok: false, error: String((e && e.message) || e) });
-
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || msg.target !== 'offscreen') return;
-    if (msg.type === 'start') { start().then(sendResponse, fail(sendResponse)); return true; }
-    if (msg.type === 'stop') { stop(msg.key).then(sendResponse, fail(sendResponse)); return true; }
+
+    if (msg.type === 'start') {
+      start().then(sendResponse, (e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+      return true;
+    }
+
+    if (msg.type === 'stop') {
+      // Відповідаємо; закриває документ (звільняє мікрофон) service worker після цієї відповіді.
+      stop(msg.key).then(sendResponse, (e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+      return true;
+    }
   });
 })();
