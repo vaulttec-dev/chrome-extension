@@ -656,11 +656,6 @@
            `${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
   }
 
-  // Зупинка з попапа.
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg && msg.target === 'content' && msg.type === 'STOP') stopCapture();
-  });
-
   // Показ кнопки під час дзвінка + автозупинка на завершенні.
   // Той самий тік раз на секунду семплить учасників/мовців і раз на 30 с
   // персистить зібране в журнал — щоб імена пережили обрив і дісталися recovery.

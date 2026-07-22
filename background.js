@@ -171,28 +171,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   switch (msg.type) {
     case 'BADGE':
       if (msg.on) {
-        // tabId у storage (не в пам'яті SW): переживає засинання worker'а під час запису,
-        // тож резервна зупинка з попапа знаходить вкладку навіть після сну.
-        chrome.storage.local.set({ isRecording: true, recordingTabId: sender.tab ? sender.tab.id : null });
+        chrome.storage.local.set({ isRecording: true });
         chrome.action.setBadgeText({ text: 'REC' });
         chrome.action.setBadgeBackgroundColor({ color: '#d93025' });
       } else {
-        chrome.storage.local.set({ isRecording: false, recordingTabId: null });
+        chrome.storage.local.set({ isRecording: false });
         chrome.action.setBadgeText({ text: '' });
       }
       break;
 
     case 'STATUS':
       chrome.storage.local.set({ lastStatus: msg.text });
-      break;
-
-    case 'STOP':
-      // Натиснуто «Зупинити» в попапі → переслати у вкладку, де йде запис.
-      chrome.storage.local.get('recordingTabId').then(({ recordingTabId }) => {
-        if (recordingTabId != null) {
-          chrome.tabs.sendMessage(recordingTabId, { target: 'content', type: 'STOP' });
-        }
-      });
       break;
 
     case 'GET_TOKEN':
@@ -219,17 +208,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       startGeminiJob(msg.job)
         .then(() => sendResponse({ ok: true }))
         .catch((e) => sendResponse({ ok: false, error: e.message }));
-      return true;
-
-    case 'GEMINI_REDO':
-      // Кнопка «Повторити конспект» у popup: перезапустити останній job зі стислішим
-      // форматом. Працює, поки аудіо-файл живе в Gemini (~48 год після зустрічі).
-      chrome.storage.local.get('lastGeminiJob').then(({ lastGeminiJob }) => {
-        if (!lastGeminiJob) { sendResponse({ ok: false, error: 'немає попереднього конспекту' }); return; }
-        startGeminiJob({ ...lastGeminiJob, retryConcise: true })
-          .then(() => sendResponse({ ok: true }))
-          .catch((e) => sendResponse({ ok: false, error: e.message }));
-      });
       return true;
   }
 });
@@ -275,12 +253,10 @@ function patchJob(job, patch) {
 }
 
 // Прибрати завдання з черги + статус і нотифікація; alarm гасимо, лише коли черга порожня.
-// Останній job лишаємо в lastGeminiJob — кнопка «Повторити конспект» у popup перезапускає
-// його, поки аудіо живе в Gemini (~48 год): рятує обрізані/невдалі конспекти без перезапису.
 async function finishJob(job, status, ok) {
   await withQueue(async () => {
     const jobs = (await readQueue()).filter((j) => !sameJob(j, job));
-    await chrome.storage.local.set({ geminiJobs: jobs, lastGeminiJob: { ...job, ticks: 0, errors: 0 } });
+    await chrome.storage.local.set({ geminiJobs: jobs });
     if (!jobs.length) await chrome.alarms.clear(GEMINI_ALARM);
   });
   MRLog.log(ok ? 'info' : 'error', 'gemini', status, { rec: job.meetingBaseName });
@@ -311,17 +287,6 @@ async function pollGeminiJob() {
   if (geminiBusy) return;
   geminiBusy = true;
   try {
-    // Міграція одиночного geminiJob зі старої версії розширення в чергу.
-    const { geminiJob: legacy } = await chrome.storage.local.get('geminiJob');
-    if (legacy) {
-      await chrome.storage.local.remove('geminiJob');
-      await withQueue(async () => {
-        const jobs = await readQueue();
-        jobs.push({ ticks: 0, errors: 0, ...legacy });
-        await chrome.storage.local.set({ geminiJobs: jobs });
-      });
-    }
-
     const jobs = await readQueue();
     if (!jobs.length) { await chrome.alarms.clear(GEMINI_ALARM); return; }
 
@@ -471,19 +436,11 @@ function resetDictation() {
 chrome.runtime.onStartup.addListener(resetDictation);
 chrome.runtime.onInstalled.addListener(resetDictation);
 
-chrome.storage.local.get(['geminiJobs', 'geminiJob']).then(({ geminiJobs, geminiJob }) => {
-  if ((Array.isArray(geminiJobs) && geminiJobs.length) || geminiJob) {
+chrome.storage.local.get('geminiJobs').then(({ geminiJobs }) => {
+  if (Array.isArray(geminiJobs) && geminiJobs.length) {
     chrome.alarms.create(GEMINI_ALARM, { periodInMinutes: 0.5 });
   }
 });
 
-// Одноразовий порятунок: якщо lastGeminiJob порожній, підхопити його з seed-файла
-// (метадані обрізаного конспекту 15.07 — щоб кнопка «Повторити конспект» його врятувала).
-// Після успішного повтору файл seed-lastjob.json можна видалити з теки розширення.
-chrome.storage.local.get('lastGeminiJob').then(async ({ lastGeminiJob }) => {
-  if (lastGeminiJob) return;
-  try {
-    const r = await fetch(chrome.runtime.getURL('seed-lastjob.json'));
-    if (r.ok) await chrome.storage.local.set({ lastGeminiJob: await r.json() });
-  } catch (_) { /* seed нема — і не треба */ }
-});
+// Прибирання ключів, що лишилися від старих версій (redo-кнопка, legacy-джоб, tabId).
+chrome.storage.local.remove(['lastGeminiJob', 'geminiJob', 'recordingTabId']);

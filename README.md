@@ -28,18 +28,22 @@ content script'у OAuth-токен (бо `chrome.identity` доступний л
 
 | Файл | Роль |
 |------|------|
-| `manifest.json` | Дозволи (`identity`, `storage`, `downloads`, `alarms`), OAuth, реєстрація скриптів. |
-| `content.js` / `content.css` | Кнопка в Meet, детекція дзвінка, захоплення (`getDisplayMedia` + мікрофон), `MediaRecorder`, аплоад відео на Drive (або локально) і заливання відео в Gemini. |
+| `manifest.json` | Дозволи (`identity`, `storage`, `downloads`, `alarms`, `offscreen`, `clipboardWrite`), OAuth, реєстрація скриптів. |
+| `content.js` / `content.css` | Кнопка в Meet, детекція дзвінка, захоплення (`getDisplayMedia` + мікрофон), `MediaRecorder`, аплоад відео й страхового аудіо на Drive (або локально) і заливання аудіо в Gemini. |
 | `gdrive.js` / `gemini.js` | Чисті функції Drive / Gemini (приймають токен/ключ) — спільні для content script і service worker, без дублювання. |
-| `background.js` | OAuth-токен для content script, резервна зупинка, фоновий конспект через `chrome.alarms` (Files API → `generateContent` → Google Doc / `.txt`). |
-| `popup.html` / `popup.js` | Статус запису + резервна кнопка «Зупинити». |
+| `background.js` | OAuth-токен для content script, фоновий конспект через `chrome.alarms` (Files API → `generateContent` → Google Doc / `.txt`) з ретраями до дедлайну та перезаливкою аудіо з Drive; стан диктофона. |
+| `popup.html` / `popup.js` | Статус, Gemini-ключ, повноцінні логи. |
+| `dictation.js` / `dictation.css` | Плаваюча кнопка 🎤 на будь-якому сайті: клік — запис, клік — транскрипт у буфер. |
+| `offscreen.html` / `offscreen.js` | Невидимий документ розширення: тримає мікрофон диктофона, транскрибує через Gemini, копіює текст у буфер. |
+| `mic.html` / `mic.js` | Одноразовий запит дозволу мікрофона для диктофона. |
 | `icons/` | Іконки (червона крапка). |
 
-Потік: клік «● Запис» → `getDisplayMedia({preferCurrentTab})` + `getUserMedia` (мікрофон) →
-мікс аудіо → `MediaRecorder` (WebM) → на стоп `content.js` бере токен у `background.js` і
-вантажить відео на Drive (інакше локально), потім (якщо є ключ) заливає відео в Gemini й
-передає `background.js` дрібну задачу — той по `chrome.alarms` чекає обробки, генерує конспект
-і кладе Google Документом у ту саму теку.
+Потік конспекту: клік «● Запис» → `getDisplayMedia({preferCurrentTab})` + `getUserMedia` (мікрофон) →
+мікс аудіо → `MediaRecorder` (WebM) → на стоп `content.js` бере токен у `background.js`,
+вантажить відео на Drive (інакше локально), зберігає туди ж страхову аудіо-доріжку, заливає
+аудіо в Gemini й передає `background.js` дрібну задачу — той по `chrome.alarms` чекає обробки,
+генерує конспект і кладе Google Документом у ту саму теку. Якщо копія в Gemini протухла
+(~48 год) — сам перезаливає аудіо з Drive; після успішного конспекту страхове аудіо видаляє.
 
 ---
 
@@ -48,7 +52,7 @@ content script'у OAuth-токен (бо `chrome.identity` доступний л
 2. Натисніть **● Запис** (внизу екрана) → у діалозі **«Поділитися»** (галочка звуку вкладки за потреби).
 3. На іконці розширення — бейдж **REC**.
 4. Завершіть дзвінок — запис зупиниться сам і збережеться.
-   (Також можна натиснути **■ Зупинити запис** на кнопці або в попапі.)
+   (Також можна натиснути **■ Зупинити запис** на кнопці у вікні Meet.)
 5. Файл `Meet <код> <дата>.webm` — у теці «Завантаження» (або в Drive, якщо налаштовано).
 
 ---
