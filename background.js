@@ -396,9 +396,16 @@ chrome.commands.onCommand.addListener((command) => {
 });
 
 chrome.runtime.onStartup.addListener(() => { /* будить SW; переозброєння робить код нижче */ });
-// Скидаємо стан диктофона на старті SW: перезавантаження розширення знищує offscreen-документ.
-chrome.storage.local.set({ dictRecording: false });
-closeOffscreen();
+
+// Скидання стану диктофона — ЛИШЕ на старті браузера та оновленні розширення.
+// НЕ в top-level: SW прокидається щопівхвилини (тики конспекту, повідомлення), і
+// top-level closeOffscreen убивав би offscreen прямо посеред запису диктофона.
+function resetDictation() {
+  chrome.storage.local.set({ dictRecording: false });
+  closeOffscreen();
+}
+chrome.runtime.onStartup.addListener(resetDictation);
+chrome.runtime.onInstalled.addListener(resetDictation);
 
 chrome.storage.local.get(['geminiJobs', 'geminiJob']).then(({ geminiJobs, geminiJob }) => {
   if ((Array.isArray(geminiJobs) && geminiJobs.length) || geminiJob) {
