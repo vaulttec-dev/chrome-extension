@@ -450,6 +450,23 @@
       return true;
     }
     const baseName = name.replace(/\.webm$/i, '');
+
+    // Аудіо-доріжка в Drive — ПОСТІЙНЕ джерело конспекту: копія в Gemini живе ~48 год,
+    // і якщо конспект за цей час не вдасться, background сам перезаллє аудіо з Drive
+    // і доробить. Після успішного конспекту background це аудіо з Drive видаляє.
+    let audioDriveId = null;
+    try {
+      setSaving(true, 'Зберігаю аудіо на Drive (страховка конспекту) — НЕ закривайте вкладку');
+      const up = await withToken(async (token) => {
+        const fId = folderId || await GDrive.getMeetingFolderId(token, baseName);
+        return GDrive.uploadResumable(token, audioBlob, baseName + ' — аудіо.webm', { folderId: fId });
+      });
+      audioDriveId = up.fileId || null;
+      MRLog.log('info', 'save', 'Аудіо-доріжку збережено в Drive (джерело конспекту): ' + baseName);
+    } catch (e) {
+      MRLog.log('warn', 'save', 'Аудіо в Drive не збереглося — конспект піде без страховки: ' + ((e && e.message) || e));
+    }
+
     try {
       setStatus('Готую конспект (надсилаю аудіо в Gemini)…');
       setSaving(true, 'Надсилаю аудіо для конспекту — НЕ закривайте вкладку');
@@ -463,7 +480,8 @@
           docName: baseName + ' — конспект',
           meetingBaseName: baseName,
           folderId: folderId || null,
-          speakerContext: meta || null
+          speakerContext: meta || null,
+          audioDriveId
         }
       });
       if (!r || !r.ok) throw new Error((r && r.error) || 'background не прийняв завдання');

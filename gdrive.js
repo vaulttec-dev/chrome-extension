@@ -139,5 +139,23 @@
     return r.json();
   }
 
-  g.GDrive = { httpError, getOrCreateFolder, getMeetingFolderId, uploadResumable, createDriveDoc };
+  // Скачати вміст файлу (для перезаливки аудіо в Gemini, коли той протух).
+  async function downloadFile(token, fileId) {
+    const r = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!r.ok) throw httpError('download', r.status);
+    return r.blob();
+  }
+
+  // Видалити файл (аудіо-джерело після успішного конспекту, щоб не смітити в Drive).
+  async function deleteFile(token, fileId) {
+    const r = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!r.ok && r.status !== 404) throw httpError('delete', r.status);
+  }
+
+  g.GDrive = { httpError, getOrCreateFolder, getMeetingFolderId, uploadResumable, createDriveDoc, downloadFile, deleteFile };
 })(globalThis);

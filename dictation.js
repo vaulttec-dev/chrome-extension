@@ -13,7 +13,7 @@
   const btn = document.createElement('button');
   btn.id = 'd2p-dictation-btn';
   btn.type = 'button';
-  btn.title = 'Диктування → транскрипт у буфер (Gemini) · Alt+Q';
+  btn.title = 'Диктування → транскрипт у буфер (Gemini)';
   btn.textContent = '🎤';
 
   const toast = document.createElement('div');
@@ -44,7 +44,7 @@
       ? 'Йде запис — натисніть, щоб зупинити й транскрибувати'
       : next === 'busy'
         ? 'Розшифровую…'
-        : 'Диктування → транскрипт у буфер (Gemini) · Alt+Q';
+        : 'Диктування → транскрипт у буфер (Gemini)';
   }
 
   // sendMessage, що НІКОЛИ не висить: reject → помилка, тиша понад timeoutMs → таймаут.
@@ -99,9 +99,7 @@
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg || msg.target !== 'content') return;
-    // Гаряча клавіша (chrome.commands → background → сюди).
-    if (msg.type === 'DICT_TOGGLE') toggle();
     // Синхронізація стану між вкладками (broadcast із background).
-    else if (msg.type === 'DICT_STATE' && !busy) setState(msg.recording ? 'recording' : 'idle');
+    if (msg.type === 'DICT_STATE' && !busy) setState(msg.recording ? 'recording' : 'idle');
   });
 })();

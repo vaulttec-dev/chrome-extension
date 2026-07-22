@@ -4,8 +4,12 @@
 importScripts('logstore.js', 'gdrive.js', 'gemini.js');
 
 const GEMINI_ALARM = 'geminiPoll';
-const GEMINI_MAX_TICKS = 60; // ~30 хв при періоді 0.5 хв — багатогодинне аудіо довго в стані PROCESSING
-const GEMINI_MAX_ERRORS = 8; // ~4 хв повторів — разовий збій мережі чи 503 від Gemini не вбиває конспект
+// Гарантія «само запишеться»: job НЕ вбиваємо по лічильниках спроб. Аудіо живе в Gemini
+// ~48 год — тож ретраїмо (з наростаючою паузою) аж до дедлайну; фатальними вважаємо лише
+// «файл видалено/не обробився». Навіть багатогодинний збій мережі конспект не втрачає.
+const GEMINI_DEADLINE_MS = 46 * 60 * 60 * 1000; // ~46 год від створення job
+const GEMINI_BACKOFF_MAX_MS = 15 * 60 * 1000;   // пауза між повторами росте до 15 хв
+const GEMINI_MAX_REUPLOADS = 5; // перезаливок аудіо з Drive (кожна дає свіжі ~46 год)
 // Додаток до промпту при повторі після обрізання (MAX_TOKENS) — вимагаємо стисліший формат.
 const CONCISE_HINT = '\n\nВАЖЛИВО: попередня спроба конспекту вийшла надто довгою і обірвалася по ліміту. ' +
   'Цього разу пиши значно стисліше: синтез по темах, БЕЗ цитування окремих реплік і БЕЗ таймкодів.';
@@ -251,7 +255,7 @@ function sameJob(a, b) { return a && b && a.geminiFileName === b.geminiFileName;
 async function startGeminiJob(job) {
   await withQueue(async () => {
     const jobs = await readQueue();
-    jobs.push({ ...job, ticks: 0, errors: 0 });
+    jobs.push({ ...job, ticks: 0, errors: 0, createdAt: job.createdAt || Date.now(), nextTryAt: 0 });
     await chrome.storage.local.set({ geminiJobs: jobs });
   });
   setStatus('Роблю конспект через Gemini…');
@@ -282,6 +286,17 @@ async function finishJob(job, status, ok) {
   MRLog.log(ok ? 'info' : 'error', 'gemini', status, { rec: job.meetingBaseName });
   setStatus(status);
   notify(ok ? 'Конспект готовий' : 'Конспект: проблема', status);
+
+  // Конспект удався → страхове аудіо в Drive більше не потрібне, прибираємо.
+  // При невдачі аудіо ЛИШАЄМО — це єдине джерело, з якого конспект ще можна зробити.
+  if (ok && job.audioDriveId) {
+    try {
+      await withFreshToken((token) => GDrive.deleteFile(token, job.audioDriveId));
+      MRLog.log('info', 'gemini', 'Страхове аудіо прибрано з Drive', { rec: job.meetingBaseName });
+    } catch (e) {
+      MRLog.log('warn', 'gemini', 'Не вдалося прибрати страхове аудіо з Drive: ' + ((e && e.message) || e), { rec: job.meetingBaseName });
+    }
+  }
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -321,17 +336,26 @@ async function pollGeminiJob() {
     }
 
     const job = jobs[0]; // обробляємо послідовно: одна генерація за раз, решта чекає в черзі
+
+    // Пауза між повторами після помилок (експоненційний backoff) — тик просто пропускаємо.
+    if (job.nextTryAt && Date.now() < job.nextTryAt) return;
+
+    // Дедлайн: файл у Gemini живе ~48 год. Якщо є аудіо-джерело в Drive — перезаливаємо
+    // його в Gemini (свіжі ~46 год) і продовжуємо; без джерела — чесно завершуємо.
+    const createdAt = job.createdAt || Date.now();
+    if (!job.createdAt) await patchJob(job, { createdAt });
+    if (Date.now() - createdAt > GEMINI_DEADLINE_MS) {
+      if (await tryReuploadFromDrive(job, geminiApiKey)) return;
+      await finishJob(job, 'Конспект не вдалося зробити за 46 год — аудіо в Gemini вже видалено. Відео зустрічі є у Drive.', false);
+      return;
+    }
+
     try {
       const file = await Gemini.geminiGetFile(job.geminiFileName, geminiApiKey);
 
-      if (file.state === 'PROCESSING') {
-        const ticks = (job.ticks || 0) + 1;
-        if (ticks >= GEMINI_MAX_TICKS) await finishJob(job, 'Конспект не вдалося зробити: тайм-аут обробки аудіо', false);
-        else await patchJob(job, { ticks });
-        return;
-      }
+      if (file.state === 'PROCESSING') return; // чекаємо далі — дедлайн і так обмежує
       if (file.state === 'FAILED') {
-        await finishJob(job, 'Конспект не вдалося зробити: Gemini не обробив аудіо', false);
+        await finishJob(job, 'Конспект не вдалося зробити: Gemini не обробив аудіо (файл FAILED)', false);
         return;
       }
 
@@ -339,31 +363,82 @@ async function pollGeminiJob() {
       const ctx = ((job.speakerContext || '') + (job.retryConcise ? CONCISE_HINT : '')) || null;
       const { text, finishReason } = await Gemini.geminiGenerate(file.uri || job.fileUri, file.mimeType || job.mimeType, geminiApiKey, ctx);
       const truncated = finishReason && finishReason !== 'STOP';
-      if (truncated && !job.retryConcise) {
-        // Обрізалося по ліміту → НЕ зберігаємо огризок, а автоматично повторюємо
-        // наступним тиком зі стислішим форматом (одна повторна спроба).
-        MRLog.log('warn', 'gemini', 'Конспект обрізано (' + finishReason + ') — автоматично повторюю стисліше', { rec: job.meetingBaseName });
+      const degenerate = looksDegenerate(text); // repetition collapse: «UUUU…» замість конспекту
+      if ((truncated || degenerate) && !job.retryConcise) {
+        // Сміття/огризок НЕ зберігаємо — автоматично повторюємо стислішим форматом.
+        MRLog.log('warn', 'gemini', 'Конспект ' + (degenerate ? 'виродився (повтори символів)' : 'обрізано (' + finishReason + ')') + ' — автоматично повторюю стисліше', { rec: job.meetingBaseName });
         await patchJob(job, { retryConcise: true });
         return;
+      }
+      if (degenerate) {
+        // Повторна спроба теж виродилася — ретраїмо далі з паузою до дедлайну (не зберігаємо сміття).
+        throw new Error('вивід виродився повторно (repetition collapse)');
       }
       if (truncated) MRLog.log('warn', 'gemini', 'Конспект знову обрізано (' + finishReason + ') — зберігаю як є', { rec: job.meetingBaseName });
       let status = await saveDoc(job, text);
       if (truncated) status += ' (увага: конспект може бути неповним — ' + finishReason + ')';
       await finishJob(job, status, !truncated);
     } catch (e) {
-      // Разова помилка мережі/503 не вбиває конспект — повторюємо наступними тиками.
-      const errors = (job.errors || 0) + 1;
       const msg = (e && e.message) || String(e);
-      if (errors >= GEMINI_MAX_ERRORS) {
-        await finishJob(job, 'Конспект не вдалося зробити: ' + msg, false);
-      } else {
-        MRLog.log('warn', 'gemini', 'Спроба ' + errors + '/' + GEMINI_MAX_ERRORS + ' не вдалася, повторю за 30 с: ' + msg, { rec: job.meetingBaseName });
-        await patchJob(job, { errors });
+      // Файл видалено з Gemini (403/404) — перезаливаємо з Drive-джерела; без нього завершуємо.
+      if (/file get (403|404)/.test(msg)) {
+        if (await tryReuploadFromDrive(job, geminiApiKey)) return;
+        await finishJob(job, 'Конспект не вдалося зробити: аудіо вже видалено з Gemini. Відео зустрічі є у Drive.', false);
+        return;
       }
+      // Будь-яка інша помилка (мережа, 5xx, ліміти) конспект НЕ вбиває: повтор із
+      // наростаючою паузою (30 с → 1 хв → … → 15 хв) аж до 46-годинного дедлайну.
+      const errors = (job.errors || 0) + 1;
+      const backoff = Math.min(GEMINI_BACKOFF_MAX_MS, 30000 * Math.pow(2, Math.min(errors - 1, 5)));
+      const leftH = Math.max(0, Math.round((GEMINI_DEADLINE_MS - (Date.now() - createdAt)) / 3600000));
+      MRLog.log('warn', 'gemini', 'Спроба ' + errors + ' не вдалася (' + msg + ') — повторю за ~' + Math.round(backoff / 60000 || 1) + ' хв, ретраю ще до ' + leftH + ' год', { rec: job.meetingBaseName });
+      await patchJob(job, { errors, nextTryAt: Date.now() + backoff });
     }
   } finally {
     geminiBusy = false;
   }
+}
+
+// Копія аудіо в Gemini протухла (48 год) → перезалити з постійного джерела в Drive.
+// Повертає true, якщо перезалито (job оновлено свіжим файлом і свіжим дедлайном).
+async function tryReuploadFromDrive(job, geminiApiKey) {
+  if (!job.audioDriveId) return false;
+  const reuploads = (job.reuploads || 0) + 1;
+  if (reuploads > GEMINI_MAX_REUPLOADS) {
+    MRLog.log('error', 'gemini', 'Вичерпано перезаливки аудіо з Drive (' + GEMINI_MAX_REUPLOADS + ') — здаюся', { rec: job.meetingBaseName });
+    return false;
+  }
+  try {
+    MRLog.log('info', 'gemini', 'Копія аудіо в Gemini протухла — перезаливаю з Drive (спроба ' + reuploads + '/' + GEMINI_MAX_REUPLOADS + ')', { rec: job.meetingBaseName });
+    const blob = await withFreshToken((token) => GDrive.downloadFile(token, job.audioDriveId));
+    const file = await Gemini.geminiUploadFile(blob, geminiApiKey, 'audio/webm');
+    await patchJob(job, {
+      geminiFileName: file.name,
+      fileUri: file.uri,
+      mimeType: file.mimeType || 'audio/webm',
+      createdAt: Date.now(), // свіжий файл → свіжий 46-годинний дедлайн
+      reuploads,
+      errors: 0,
+      nextTryAt: 0
+    });
+    return true;
+  } catch (e) {
+    MRLog.log('warn', 'gemini', 'Перезаливка аудіо з Drive не вдалася: ' + ((e && e.message) || e), { rec: job.meetingBaseName });
+    // Полічити спробу й відкласти наступну, щоб не молотити щотика.
+    await patchJob(job, { reuploads, nextTryAt: Date.now() + GEMINI_BACKOFF_MAX_MS });
+    return true; // job живий — повторимо перезаливку пізніше
+  }
+}
+
+// Репетишн-колапс Gemini: «конспект» із нескінченного повтору одного символу/фрази
+// (реальний кейс — суцільні «U»). Один символ понад 40% тексту = сміття, не зберігаємо.
+function looksDegenerate(text) {
+  if (!text || text.length < 400) return false;
+  const counts = {};
+  for (const ch of text) { if (ch !== ' ' && ch !== '\n') counts[ch] = (counts[ch] || 0) + 1; }
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  if (!total) return false;
+  return Math.max(...Object.values(counts)) / total > 0.4;
 }
 
 // Зберегти конспект; повертає статус-рядок. Кидає лише якщо й Drive, і локально не вдалося.
@@ -384,17 +459,6 @@ async function saveDoc(job, text) {
 // Страховка: chrome.alarms не гарантовано переживають перезапуск браузера. Якщо в черзі
 // лишилися конспекти (браузер закрили, поки вони робились) — переозброюємо alarm на
 // кожному старті SW; onStartup-слухач гарантує, що SW прокинеться на старті браузера.
-// Гаряча клавіша диктофона → тогл у активній вкладці (content script dictation.js).
-chrome.commands.onCommand.addListener((command) => {
-  if (command !== 'toggle-dictation') return;
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    const tab = tabs && tabs[0];
-    if (tab && tab.id != null) {
-      chrome.tabs.sendMessage(tab.id, { target: 'content', type: 'DICT_TOGGLE' }, () => void chrome.runtime.lastError);
-    }
-  });
-});
-
 chrome.runtime.onStartup.addListener(() => { /* будить SW; переозброєння робить код нижче */ });
 
 // Скидання стану диктофона — ЛИШЕ на старті браузера та оновленні розширення.

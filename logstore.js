@@ -4,7 +4,7 @@
 // Дзеркалить у console (щоб DevTools теж працював) і додає запис у кільцевий буфер.
 (function (g) {
   const KEY = 'logs';
-  const MAX = 300; // старіші за це витісняються
+  const MAX = 1000; // старіші за це витісняються
   let chain = Promise.resolve(); // серіалізуємо read-modify-write у межах контексту
 
   // level: 'info' | 'warn' | 'error'; stage: 'record'|'save'|'gemini'|'recovery'|'status'|...

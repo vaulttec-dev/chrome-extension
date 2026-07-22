@@ -1,27 +1,13 @@
-// popup.js — статус запису та резервна ручна зупинка.
+// popup.js — статус, Gemini-ключ і повноцінний журнал (персистентні логи).
 const statusEl = document.getElementById('status');
-const stopBtn = document.getElementById('stop');
-
-function render(isRecording, lastStatus) {
-  statusEl.textContent = lastStatus || (isRecording ? 'Запис…' : 'Готово до запису');
-  stopBtn.disabled = !isRecording;
-}
 
 function refresh() {
   chrome.storage.local.get(['isRecording', 'lastStatus']).then(({ isRecording, lastStatus }) => {
-    render(!!isRecording, lastStatus);
+    statusEl.textContent = lastStatus || (isRecording ? 'Запис…' : 'Готово до запису');
   });
 }
 
 refresh();
-
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local') refresh();
-});
-
-stopBtn.addEventListener('click', () => {
-  chrome.runtime.sendMessage({ target: 'bg', type: 'STOP' });
-});
 
 // ---- Gemini API-ключ ----
 const keyInput = document.getElementById('gkey');
@@ -46,52 +32,43 @@ saveKeyBtn.addEventListener('click', () => {
   });
 });
 
-// ---- Повторити останній конспект (поки аудіо живе в Gemini, ~48 год) ----
-const redoBtn = document.getElementById('redo');
-const redoHint = document.getElementById('redohint');
-
-function renderRedo(lastGeminiJob) {
-  redoBtn.disabled = !lastGeminiJob;
-  redoHint.textContent = lastGeminiJob
-    ? 'Останній: ' + (lastGeminiJob.docName || '') + ' (діє ~48 год після зустрічі)'
-    : '';
-}
-chrome.storage.local.get('lastGeminiJob').then(({ lastGeminiJob }) => renderRedo(lastGeminiJob));
-
-redoBtn.addEventListener('click', () => {
-  redoBtn.disabled = true;
-  chrome.runtime.sendMessage({ target: 'bg', type: 'GEMINI_REDO' }, (r) => {
-    redoHint.textContent = r && r.ok
-      ? 'Конспект перезапущено — результат буде в тій самій теці Drive.'
-      : 'Не вдалося: ' + ((r && r.error) || 'невідома помилка');
-    redoBtn.disabled = false;
-  });
-});
-
-// ---- Історія (персистентний лог) ----
+// ---- Логи (персистентний журнал; найновіші зверху, з роздільниками по днях) ----
 const logEl = document.getElementById('log');
 const clearLogBtn = document.getElementById('clearlog');
 
+const p = (n) => String(n).padStart(2, '0');
 function fmtTime(t) {
   const d = new Date(t);
-  const p = (n) => String(n).padStart(2, '0');
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function fmtDay(t) {
+  const d = new Date(t);
+  return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()}`;
 }
 
 function renderLog(logs) {
   const arr = Array.isArray(logs) ? logs : [];
   if (!arr.length) { logEl.innerHTML = '<span class="empty">Поки що порожньо.</span>'; return; }
-  // найновіші зверху
   logEl.innerHTML = '';
+  let curDay = '';
   for (let i = arr.length - 1; i >= 0; i--) {
     const e = arr[i];
+    const day = fmtDay(e.t);
+    if (day !== curDay) {
+      curDay = day;
+      const hdr = document.createElement('div');
+      hdr.className = 'day';
+      hdr.textContent = day;
+      logEl.appendChild(hdr);
+    }
     const row = document.createElement('div');
     row.className = 'row' + (e.lvl === 'warn' ? ' warn' : e.lvl === 'error' ? ' error' : '');
     const t = document.createElement('span');
     t.className = 't';
     t.textContent = fmtTime(e.t) + ' ';
     row.appendChild(t);
-    row.appendChild(document.createTextNode('[' + (e.stage || '') + '] ' + (e.msg || '')));
+    const extra = e.rec ? ' · ' + e.rec : '';
+    row.appendChild(document.createTextNode('[' + (e.stage || '') + '] ' + (e.msg || '') + extra));
     logEl.appendChild(row);
   }
 }
@@ -103,5 +80,7 @@ clearLogBtn.addEventListener('click', () => {
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes.logs) renderLog(changes.logs.newValue);
+  if (area !== 'local') return;
+  if (changes.logs) renderLog(changes.logs.newValue);
+  if (changes.isRecording || changes.lastStatus) refresh();
 });
