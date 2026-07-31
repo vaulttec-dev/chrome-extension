@@ -166,7 +166,7 @@
 
       recorder.ondataavailable = (e) => {
         if (!e.data || !e.data.size) return;
-        if (recId) RecStore.appendChunk(recId, e.data, 'video').catch((err) => MRLog.log('warn', 'record', 'Втрачено відео-шматок: ' + ((err && err.message) || err)));
+        if (recId) RecStore.appendChunk(recId, e.data, 'video').catch((err) => onChunkError(err, 'відео'));
         else chunks.push(e.data);
       };
       recorder.onstop = onRecorderStop;
@@ -183,7 +183,7 @@
       audioStopPromise = new Promise((resolve) => { audioRecorder.onstop = resolve; });
       audioRecorder.ondataavailable = (e) => {
         if (!e.data || !e.data.size) return;
-        if (recId) RecStore.appendChunk(recId, e.data, 'audio').catch((err) => MRLog.log('warn', 'record', 'Втрачено аудіо-шматок: ' + ((err && err.message) || err)));
+        if (recId) RecStore.appendChunk(recId, e.data, 'audio').catch((err) => onChunkError(err, 'аудіо'));
         else audioChunks.push(e.data);
       };
       audioRecorder.onerror = (e) => MRLog.log('error', 'record', 'Помилка аудіо-рекордера: ' + ((e && e.error && e.error.message) || (e && e.error) || e));
@@ -193,6 +193,7 @@
       audioRecorder.start(1000);
 
       isRecording = true;
+      lowStorageStopping = false;
       resetMeta(); // почати збір учасників і «хто говорить» для конспекту
       render();
       removeRecoveryBanner(); // йде новий запис — старий банер відновлення прибрати
@@ -216,6 +217,43 @@
       if (audioRecorder && audioRecorder.state !== 'inactive') audioRecorder.stop();
       recorder.stop();
     }
+  }
+
+  // ---- Захист від вичерпання сховища ----
+  // Запис шматками йде в IndexedDB; коли квота диска закінчується, шматки починають
+  // губитися мовчки. Замість деградації — одразу зупиняємо запис і зберігаємо те, що є.
+  const LOW_STORAGE_MB = 400; // ~кілька хвилин запису запасу
+  let lowStorageStopping = false;
+
+  function autoStopLowStorage(why) {
+    if (!isRecording || lowStorageStopping) return;
+    lowStorageStopping = true;
+    MRLog.log('error', 'record', 'Сховище вичерпується (' + why + ') — авто-зупинка, зберігаю що є');
+    setStatus('Пам\'ять вичерпується — зупиняю запис і зберігаю…');
+    stopCapture();
+  }
+
+  function isQuotaError(err) {
+    const name = err && err.name;
+    const msg = String((err && err.message) || err || '');
+    return name === 'QuotaExceededError' || /quota|disk|space/i.test(msg);
+  }
+
+  function onChunkError(err, kind) {
+    if (isQuotaError(err)) autoStopLowStorage('не записався ' + kind + '-шматок: ' + ((err && err.message) || err));
+    else MRLog.log('warn', 'record', 'Втрачено ' + kind + '-шматок: ' + ((err && err.message) || err));
+  }
+
+  // Проактивна перевірка запасу квоти (раз на 15 с під час запису) — зупиняємось ДО
+  // того, як почнуть губитися шматки.
+  async function checkStorageHeadroom() {
+    try {
+      if (!navigator.storage || !navigator.storage.estimate) return;
+      const { usage, quota } = await navigator.storage.estimate();
+      if (!quota) return;
+      const freeMb = Math.round((quota - usage) / (1024 * 1024));
+      if (freeMb < LOW_STORAGE_MB) autoStopLowStorage('вільно ~' + freeMb + ' МБ');
+    } catch (_) { /* estimate недоступний — реактивний захист лишається */ }
   }
 
   async function onRecorderStop() {
@@ -665,7 +703,9 @@
     if (onMeeting) ensureButton(); else removeButton();
     if (isRecording) {
       sampleMeta();
-      if (recId && (++metaTick % 30) === 0) {
+      ++metaTick;
+      if (metaTick % 15 === 0) checkStorageHeadroom();
+      if (recId && metaTick % 30 === 0) {
         const meta = buildMeetingMeta();
         if (meta) RecStore.updateSession(recId, { meta }).catch(() => {});
       }
