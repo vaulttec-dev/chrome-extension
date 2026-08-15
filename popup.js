@@ -9,6 +9,29 @@ function refresh() {
 
 refresh();
 
+// ---- Якість відео ----
+// «Авто» = замір швидкості кодування на старті запису (див. content.js): вища
+// роздільність вмикається лише там, де машина витягне її без дропу кадрів.
+const qualityEl = document.getElementById('quality');
+const qualityHintEl = document.getElementById('qualityhint');
+
+function renderQualityHint(v) {
+  qualityHintEl.textContent = v === 'auto'
+    ? 'Перед стартом заміряється швидкість кодера й береться найвищий профіль без ризику ривків.'
+    : 'Фіксований профіль. Якщо CPU не встигатиме — розширення само знизить кадри/с, роздільність лишиться.';
+}
+
+chrome.storage.local.get('videoQuality').then(({ videoQuality }) => {
+  const v = videoQuality || 'auto';
+  qualityEl.value = v;
+  renderQualityHint(v);
+});
+
+qualityEl.addEventListener('change', () => {
+  const v = qualityEl.value;
+  chrome.storage.local.set({ videoQuality: v }).then(() => renderQualityHint(v));
+});
+
 // ---- Gemini API-ключ ----
 const keyInput = document.getElementById('gkey');
 const saveKeyBtn = document.getElementById('savekey');

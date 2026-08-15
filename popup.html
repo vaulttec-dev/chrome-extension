@@ -29,7 +29,7 @@
       .hint { font-size: 12px; color: #80868b; margin: 10px 0 0; }
       hr { border: 0; border-top: 1px solid #eceff1; margin: 14px 0 10px; }
       .ghdr { display: block; font-size: 13px; font-weight: 500; margin: 0 0 6px; }
-      input {
+      input, select {
         width: 100%;
         box-sizing: border-box;
         padding: 8px;
@@ -37,6 +37,8 @@
         border-radius: 6px;
         font-size: 13px;
         margin: 0 0 8px;
+        background: #fff;
+        color: inherit;
       }
       .loghdr { display: flex; align-items: center; justify-content: space-between; margin: 0 0 6px; }
       .loghdr .ghdr { margin: 0; }
@@ -68,6 +70,16 @@
   <body>
     <h1>Запис Meet → Drive</h1>
     <p id="status">—</p>
+
+    <hr />
+    <label class="ghdr" for="quality">Якість відео</label>
+    <select id="quality">
+      <option value="auto">Авто — під потужність комп'ютера</option>
+      <option value="1080">1080p — найчіткіше (≈2,2 ГБ/год)</option>
+      <option value="900">900p — компроміс (≈1,6 ГБ/год)</option>
+      <option value="720">720p — найлегше (≈1,1 ГБ/год)</option>
+    </select>
+    <p id="qualityhint" class="hint"></p>
 
     <hr />
     <label class="ghdr" for="gkey">Gemini API-ключ (авто-конспект)</label>

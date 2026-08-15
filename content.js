@@ -19,6 +19,11 @@
   let recId = null;        // id сесії в журналі IndexedDB (null → пишемо в пам'ять)
   let recName = null;      // ім'я файлу, зафіксоване на старті
   let recoveryBanner = null;
+  let videoTrack = null;   // доріжка екрана — за нею стежимо на предмет дропнутих кадрів
+  let fpsCap = 30;         // поточне обмеження к/с (знижуємо, якщо CPU не тягне)
+  let dropPrev = null;     // попередній замір videoTrack.stats
+  let cleanSamples = 0;    // скільки замірів поспіль без дропів (для повернення к/с угору)
+  let dropWatchLogged = false; // чи вже писали в журнал, доступна статистика кадрів чи ні
 
   function meetCode() {
     const m = location.pathname.match(MEET_CODE_RE);
@@ -112,6 +117,146 @@
     if (savingBusy) { e.preventDefault(); e.returnValue = ''; }
   });
 
+  // ---- Якість відео: профіль під реальну потужність кодування ----
+  // Вартість кодування визначається пікселями за секунду, а не бітрейтом: 1080p30 удвічі
+  // дорожчий за 720p30, тоді як подвоєння бітрейта майже безкоштовне для CPU. Тому:
+  // роздільність обираємо ЗАМІРОМ (нижче), а бітрейт беремо щедрий — саме він дає
+  // читабельний текст на демонстрації екрана.
+  // needProbe — скільки кадрів/с 1080p машина має кодувати в бенчі (probeEncodeFps), щоб
+  // профіль був безпечним: запас ~3× до потрібних 30 к/с, бо під час зустрічі CPU ділиться
+  // ще й з декодуванням відео учасників, композитингом і рештою вкладок.
+  // Орієнтир: Intel UHD 630 + Chrome без апаратного кодера дає ~95–130 к/с на вільній
+  // машині (→ 1080p) і падає до 25–55 на завантаженій (→ 900p/720p).
+  const QUALITY_PROFILES = {
+    '1080': { label: '1080p', height: 1080, bitrate: 5_000_000, needProbe: 90 },
+    '900':  { label: '900p',  height: 900,  bitrate: 3_500_000, needProbe: 55 },
+    '720':  { label: '720p',  height: 720,  bitrate: 2_500_000, needProbe: 0 }
+  };
+  const QUALITY_ORDER = ['1080', '900', '720'];
+
+  // Кадри для бенчу: дрібний текст, що змінюється на кожному кроці — приблизно те, що дає
+  // демонстрація екрана (найдорожчий для кодера випадок).
+  function benchFrames(g, cv, from, n) {
+    const out = [];
+    for (let i = from; i < from + n; i++) {
+      g.fillStyle = `hsl(${(i * 17) % 360},50%,45%)`;
+      g.fillRect(0, 0, cv.width, cv.height);
+      g.fillStyle = '#fff';
+      g.font = '28px sans-serif';
+      for (let k = 0; k < 20; k++) g.fillText('Meet 1234567890 abcdefghijklmn', (i * 31 + k * 53) % (cv.width - 500), 40 + k * 50);
+      out.push(new VideoFrame(cv, { timestamp: i * 33333 }));
+    }
+    return out;
+  }
+
+  // Бенч кодера (~0.7 с): скільки кадрів 1080p ця машина стискає ЗАРАЗ, з поточним
+  // навантаженням. Саме поточне навантаження (а не залізо) вирішувало, чи будуть ривки —
+  // тому міряємо на кожному старті, а не один раз назавжди.
+  // Прогрів + медіана трьох прогонів — обов'язкові: один короткий прогін ловить ініціалізацію
+  // кодера й випадкові підвисання планувальника й дає розкид у 3× (заміряно: 26/52/74 к/с
+  // підряд на одній машині); з прогрівом і медіаною розкид падає до ±15%.
+  async function probeEncodeFps() {
+    if (!window.VideoEncoder || !window.OffscreenCanvas) return null;
+    const W = 1920, H = 1080, RUNS = 3, N = 12, WARM = 5;
+    let enc = null;
+    let frames = [];
+    try {
+      const cv = new OffscreenCanvas(W, H);
+      const g = cv.getContext('2d');
+      let encErr = null;
+      enc = new VideoEncoder({ output: () => {}, error: (e) => { encErr = e; } });
+      enc.configure({ codec: 'vp8', width: W, height: H, bitrate: 4_000_000, framerate: 30 });
+
+      frames = benchFrames(g, cv, 0, WARM);
+      for (let i = 0; i < WARM; i++) { enc.encode(frames[i], { keyFrame: i === 0 }); frames[i].close(); }
+      await enc.flush();
+
+      const runs = [];
+      for (let r = 0; r < RUNS; r++) {
+        frames = benchFrames(g, cv, 100 + r * N, N);
+        const t0 = performance.now();
+        for (let i = 0; i < N; i++) { enc.encode(frames[i], { keyFrame: false }); frames[i].close(); }
+        await enc.flush();
+        const dt = performance.now() - t0;
+        if (dt <= 0) return null;
+        runs.push(N / (dt / 1000));
+      }
+      if (encErr) return null;
+      runs.sort((a, b) => a - b);
+      return Math.round(runs[Math.floor(RUNS / 2)]);
+    } catch (_) {
+      return null; // WebCodecs недоступний або впав → лишаємось на безпечному профілі
+    } finally {
+      for (const f of frames) { try { f.close(); } catch (_) {} } // повторний close() безпечний
+      try { if (enc && enc.state !== 'closed') enc.close(); } catch (_) {}
+    }
+  }
+
+  async function pickQualityProfile() {
+    let pref = 'auto';
+    try {
+      const { videoQuality } = await chrome.storage.local.get('videoQuality');
+      if (videoQuality === 'auto' || QUALITY_PROFILES[videoQuality]) pref = videoQuality;
+    } catch (_) { /* налаштування недоступні → авто */ }
+    if (pref !== 'auto') return { profile: QUALITY_PROFILES[pref], why: 'вибрано вручну' };
+
+    const fps = await probeEncodeFps();
+    if (!fps) return { profile: QUALITY_PROFILES['720'], why: 'заміряти кодер не вдалося' };
+    const key = QUALITY_ORDER.find((k) => fps >= QUALITY_PROFILES[k].needProbe) || '720';
+    return { profile: QUALITY_PROFILES[key], why: `кодер тягне ~${fps} к/с на 1080p` };
+  }
+
+  // ---- Нагляд за дропнутими кадрами під час запису ----
+  // Замір на старті не бачить майбутнього: через 20 хвилин зустрічі можна відкрити збірку
+  // й посадити CPU. Тоді джерело починає викидати кадри, які кодер не встиг забрати —
+  // це і є «ривки». Реакція: знижуємо к/с (роздільність НЕ чіпаємо: зміна розміру
+  // всередині webm ламає перемотку в багатьох плеєрах), а коли попустить — вертаємо.
+  const FPS_STEPS = [30, 24, 20, 15];
+
+  function setFpsCap(next, why) {
+    if (!videoTrack || next === fpsCap) return;
+    const prev = fpsCap;
+    fpsCap = next;
+    videoTrack.applyConstraints({ frameRate: { max: next } })
+      .then(() => MRLog.log('warn', 'record', `Кадрів/с: ${prev} → ${next} (${why})`))
+      .catch((e) => { fpsCap = prev; MRLog.log('warn', 'record', 'Не вдалося змінити к/с: ' + ((e && e.message) || e)); });
+  }
+
+  function checkFrameDrops() {
+    if (!videoTrack || videoTrack.readyState !== 'live') return;
+    // MediaStreamTrackVideoStats (Chrome 125+). Немає — пропускаємо: нагляд
+    // необов'язковий, старт-профіль уже консервативний.
+    const s = videoTrack.stats;
+    if (!dropWatchLogged) {
+      dropWatchLogged = true;
+      MRLog.log('info', 'record', (s && typeof s.discardedFrames === 'number')
+        ? 'Нагляд за дропом кадрів увімкнено'
+        : 'Статистика кадрів недоступна — к/с не підлаштовуватимуться (профіль лишиться стартовим)');
+    }
+    if (!s || typeof s.discardedFrames !== 'number') return;
+    const cur = { d: s.discardedFrames, v: s.deliveredFrames || 0 };
+    const prev = dropPrev;
+    dropPrev = cur;
+    if (!prev) return;
+    const dropped = cur.d - prev.d;
+    const delivered = cur.v - prev.v;
+    const total = dropped + delivered;
+    if (total < 30) return; // статична картинка → кадрів мало, висновків не робимо
+    const ratio = dropped / total;
+    if (ratio > 0.12) {
+      cleanSamples = 0;
+      const i = FPS_STEPS.indexOf(fpsCap);
+      if (i >= 0 && i < FPS_STEPS.length - 1) setFpsCap(FPS_STEPS[i + 1], `дропається ${Math.round(ratio * 100)}% кадрів`);
+    } else if (ratio < 0.02) {
+      // 3 хвилини чистих замірів → CPU звільнився, можна повернути плавність.
+      if (++cleanSamples >= 18) {
+        cleanSamples = 0;
+        const i = FPS_STEPS.indexOf(fpsCap);
+        if (i > 0) setFpsCap(FPS_STEPS[i - 1], 'дропів немає — повертаю плавність');
+      }
+    }
+  }
+
   // ---- Захоплення + запис ----
   async function startCapture() {
     if (recorder) return;
@@ -119,17 +264,22 @@
     try {
       // Відео + звук вкладки. preferCurrentTab → діалог «Поділитися цією вкладкою?»
       // саме для Meet (без вибору вікна/екрана; поточну вкладку видно й можна обрати).
-      // На цій машині Chrome кодує відео ТІЛЬКИ процесором (Video Encode: software).
-      // Тому на завантаженому профілі CPU не встигає → дропає кадри → ривки.
-      // 720p/30fps удвічі дешевші за 1080p — витягує навіть зайнятий профіль.
-      // Хочеш 1080p — постав height: { max: 1080 } (краще разом з апаратним кодуванням).
+      // Просимо максимум (1080p), а вниз обмежуємо вже після заміру кодера — так
+      // getDisplayMedia викликається одразу після кліку й гарантовано має «user gesture»
+      // (замір триває пів секунди й з'їв би цей дозвіл, якби йшов першим).
       const display = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 30, max: 30 }, height: { max: 720 } },
+        video: { frameRate: { ideal: 30, max: 30 }, height: { max: 1080 } },
         audio: true,
         preferCurrentTab: true
       });
+      videoTrack = display.getVideoTracks()[0];
+      // Підказка кодеру: у зустрічі цінна читабельність тексту на демонстрації екрана,
+      // а не плавність руху — 'text' просить берегти різкі краї коштом плавності.
+      try { videoTrack.contentHint = 'text'; } catch (_) {}
 
       // Мікрофон — у контексті Meet дозвіл уже є, тож працює без запиту.
+      // Замір кодера йде паралельно з запитом мікрофона, щоб не додавати затримки.
+      const qualityPromise = pickQualityProfile();
       let mic = null, micError = '';
       try {
         mic = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -137,6 +287,33 @@
         micError = (e && e.name) ? `${e.name}: ${e.message}` : String(e);
       }
       streams = [display, mic].filter(Boolean);
+
+      // Обрана якість: роздільність тиснемо на самій доріжці (джерело віддає менше
+      // пікселів → кодеру легше), бітрейт задаємо рекордеру нижче.
+      const quality = await qualityPromise;
+      fpsCap = 30;
+      dropPrev = null;
+      cleanSamples = 0;
+      dropWatchLogged = false;
+      if (quality.profile.height < 1080) {
+        try {
+          await videoTrack.applyConstraints({ height: { max: quality.profile.height }, frameRate: { max: 30 } });
+        } catch (e) {
+          // Не критично: бітрейт підженемо під фактичну висоту (нижче), а дропи підхопить
+          // нагляд за кадрами.
+          MRLog.log('warn', 'record', 'Не вдалося обмежити роздільність до ' + quality.profile.label + ': ' + ((e && e.message) || e));
+        }
+      }
+
+      // Бітрейт — за ФАКТИЧНОЮ висотою доріжки, а не за бажаною. Два реальні розходження:
+      // вікно Meet менше за профіль (тоді 5 Мбіт/с — просто роздуті гігабайти) або
+      // applyConstraints не спрацював (тоді 2.5 Мбіт/с на 1080p — це «мило»).
+      const trackH = ((videoTrack.getSettings && videoTrack.getSettings()) || {}).height || quality.profile.height;
+      const effKey = QUALITY_ORDER.find((k) => trackH >= QUALITY_PROFILES[k].height) || '720';
+      const bitrate = QUALITY_PROFILES[effKey].bitrate;
+      if (trackH > quality.profile.height + 8) {
+        MRLog.log('warn', 'record', `Доріжка лишилась ${trackH}p замість ${quality.profile.label} — тримати CPU доведеться зниженням кадрів/с`);
+      }
 
       // Мікс: звук вкладки + мікрофон → одна доріжка.
       audioCtx = new AudioContext();
@@ -150,8 +327,14 @@
       const mime = ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm']
         .find((t) => MediaRecorder.isTypeSupported(t)) || 'video/webm';
 
-      // Фіксований бітрейт під 720p — менше навантаження на CPU-кодування.
-      recorder = new MediaRecorder(mixed, { mimeType: mime, videoBitsPerSecond: 2_500_000 });
+      // Бітрейт — з обраного профілю. Він майже не впливає на навантаження CPU (на відміну
+      // від роздільності), зате прямо визначає, чи буде читабельним дрібний текст.
+      // audioBitsPerSecond задаємо явно, щоб звук у відео не залежав від дефолтів Chrome.
+      recorder = new MediaRecorder(mixed, {
+        mimeType: mime,
+        videoBitsPerSecond: bitrate,
+        audioBitsPerSecond: 128_000
+      });
 
       // Журнал на диск: ім'я й id фіксуємо на старті, щоб відновлений файл був ідентичний.
       capturedCode = meetCode();
@@ -174,7 +357,7 @@
       recorder.onerror = (e) => MRLog.log('error', 'record', 'Помилка відео-рекордера: ' + ((e && e.error && e.error.message) || (e && e.error) || e));
 
       // Паралельно пишемо лише змікшований звук (вкладка + мікрофон) окремою доріжкою.
-      // У Gemini шлемо саме її: відео 720p за кілька годин — це ГБ і мільйони токенів,
+      // У Gemini шлемо саме її: відео за кілька годин — це ГБ і мільйони токенів,
       // тоді як opus-аудіо влазить і в ліміт файлу (2 ГБ), і в контекст моделі.
       audioChunks = [];
       const audioMime = ['audio/webm;codecs=opus', 'audio/webm']
@@ -188,7 +371,7 @@
       };
       audioRecorder.onerror = (e) => MRLog.log('error', 'record', 'Помилка аудіо-рекордера: ' + ((e && e.error && e.error.message) || (e && e.error) || e));
 
-      display.getVideoTracks()[0].addEventListener('ended', stopCapture);
+      videoTrack.addEventListener('ended', stopCapture);
       recorder.start(1000);
       audioRecorder.start(1000);
 
@@ -203,6 +386,11 @@
       if (!mic) missing.push('без мікрофона [' + (micError || '?') + ']');
       if (!display.getAudioTracks().length) missing.push('без звуку вкладки — поставте галочку в діалозі');
       MRLog.log('info', 'record', 'Старт запису: ' + recName + (missing.length ? ' [' + missing.join('; ') + ']' : '') + (recId ? '' : ' (у пам\'ять — журнал недоступний)'));
+      // Фактичні параметри доріжки — щоб у журналі було видно, з чим реально писали
+      // (запитане й видане джерелом може не збігатися).
+      const st = (videoTrack.getSettings && videoTrack.getSettings()) || {};
+      MRLog.log('info', 'record', `Якість: ${quality.profile.label} @ ${bitrate / 1e6} Мбіт/с (${quality.why})` +
+        (st.width ? ` — доріжка ${st.width}×${st.height}${st.frameRate ? ' @ ' + Math.round(st.frameRate) + ' к/с' : ''}` : ''));
       setStatus(missing.length ? 'Запис… (' + missing.join('; ') + ')' : 'Запис…');
     } catch (e) {
       MRLog.log('warn', 'record', 'Старт скасовано/помилка: ' + ((e && e.message) || e));
@@ -673,6 +861,9 @@
   function cleanupStreams() {
     for (const s of streams) s.getTracks().forEach((t) => t.stop());
     streams = [];
+    videoTrack = null;
+    dropPrev = null;
+    cleanSamples = 0;
     if (audioCtx) { audioCtx.close(); audioCtx = null; }
   }
   function cleanup() {
@@ -704,6 +895,7 @@
     if (isRecording) {
       sampleMeta();
       ++metaTick;
+      if (metaTick % 10 === 0) checkFrameDrops();
       if (metaTick % 15 === 0) checkStorageHeadroom();
       if (recId && metaTick % 30 === 0) {
         const meta = buildMeetingMeta();
