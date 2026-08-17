@@ -407,11 +407,24 @@ function looksDegenerate(text) {
 }
 
 // Зберегти конспект; повертає статус-рядок. Кидає лише якщо й Drive, і локально не вдалося.
-async function saveDoc(job, text) {
+// Перший рядок відповіді Gemini — службова «ТЕМА: …»: у документ вона не потрапляє,
+// натомість нею перейменовуємо теку зустрічі («Тема — дата час»).
+async function saveDoc(job, raw) {
+  const { topic, text } = Gemini.splitTopic(raw);
   try {
     await withFreshToken(async (token) => {
       const folderId = job.folderId || await GDrive.getMeetingFolderId(token, job.meetingBaseName);
       await GDrive.createDriveDoc(token, folderId, job.docName, text);
+      // Перейменування — після збереження Doc: якщо воно впаде, конспект уже на місці.
+      const nice = topic && meetingFolderName(topic, job.meetingBaseName);
+      if (nice && nice !== job.meetingBaseName) {
+        try {
+          await GDrive.renameFile(token, folderId, nice);
+          MRLog.log('info', 'save', 'Теку зустрічі перейменовано: ' + nice, { rec: job.meetingBaseName });
+        } catch (e) {
+          MRLog.log('warn', 'save', 'Не вдалося перейменувати теку зустрічі: ' + ((e && e.message) || e), { rec: job.meetingBaseName });
+        }
+      }
     });
     return 'Конспект готовий ✓ — у теці «Meeting Recordings»';
   } catch (docErr) {
@@ -419,6 +432,14 @@ async function saveDoc(job, text) {
     await download('data:text/plain;charset=utf-8,' + encodeURIComponent(text), job.docName + '.txt');
     return 'Конспект готовий ✓ — збережено локально (.txt)';
   }
+}
+
+// Назва теки зустрічі: «Тема — РРРР-ММ-ДД ГГ-ХХ». Дату й час беремо з базового імені
+// запису (там «Meet <код> РРРР-ММ-ДД ГГ-ХХ-СС»); без них перейменування не робимо —
+// теки без дати сортувалися б у Drive як попало.
+function meetingFolderName(topic, baseName) {
+  const m = String(baseName || '').match(/(\d{4}-\d{2}-\d{2}) (\d{2}-\d{2})/);
+  return m ? `${topic} — ${m[1]} ${m[2]}` : null;
 }
 
 // Страховка: chrome.alarms не гарантовано переживають перезапуск браузера. Якщо в черзі

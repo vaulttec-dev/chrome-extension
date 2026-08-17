@@ -139,6 +139,17 @@
     return r.json();
   }
 
+  // Перейменувати файл або теку (тека зустрічі дістає назву теми, коли конспект готовий).
+  async function renameFile(token, fileId, name) {
+    const r = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    if (!r.ok) throw httpError('rename', r.status);
+    return r.json();
+  }
+
   // Скачати вміст файлу (для перезаливки аудіо в Gemini, коли той протух).
   async function downloadFile(token, fileId) {
     const r = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
@@ -157,5 +168,5 @@
     if (!r.ok && r.status !== 404) throw httpError('delete', r.status);
   }
 
-  g.GDrive = { httpError, getOrCreateFolder, getMeetingFolderId, uploadResumable, createDriveDoc, downloadFile, deleteFile };
+  g.GDrive = { httpError, getOrCreateFolder, getMeetingFolderId, uploadResumable, createDriveDoc, renameFile, downloadFile, deleteFile };
 })(globalThis);
