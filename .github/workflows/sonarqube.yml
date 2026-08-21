@@ -1,0 +1,172 @@
+name: SonarQube
+
+# Project-agnostic SonarQube workflow — copy to .github/workflows/ in any repo.
+# The project key is taken from the SONAR_PROJECT_KEY repo variable (falling back
+# to the repo name), so nothing here is hardcoded to a single project.
+#
+# Per-repo setup (see sonarqube-selfhosted README § "Onboard a new repo"):
+#   gh secret   set SONAR_TOKEN
+#   gh secret   set SONAR_HOST_URL
+#   gh variable set SONAR_PROJECT_KEY --body "<project-key>"
+#
+# Adjust the trigger branches and the coverage block to the project.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: sonarqube-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  # Falls back to the repository name when the variable is unset.
+  SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY || github.event.repository.name }}
+
+jobs:
+  scan:
+    name: 📡 SonarQube
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # Full history for accurate blame/new-code detection
+          fetch-depth: 0
+
+      # Skip gracefully (with a warning) until the self-hosted server is up
+      - name: 🔑 Check SonarQube secrets
+        id: creds
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          if [ -n "$SONAR_TOKEN" ] && [ -n "$SONAR_HOST_URL" ]; then
+            echo "present=true" >> $GITHUB_OUTPUT
+          else
+            echo "present=false" >> $GITHUB_OUTPUT
+            echo "⚠️ **SonarQube skipped — SONAR_TOKEN / SONAR_HOST_URL secrets are not set**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # --- OPTIONAL: coverage for the scanner -----------------------------
+      # Customise or delete per project. If you generate an lcov report here,
+      # point sonar.javascript.lcov.reportPaths at it in sonar-project.properties.
+      # Note: vitest writes SF: paths relative to its cwd, while SonarQube resolves
+      # them relative to the repo root — rewrite the prefix if they differ, e.g.
+      #   sed -i 's|^SF:|SF:apps/<app>/|' <path>/coverage/lcov.info
+      #
+      # - name: 🟢 Setup Node and pnpm
+      #   if: steps.creds.outputs.present == 'true'
+      #   uses: ./.github/actions/setup-node-pnpm
+      #   with:
+      #     node-version: '22'
+      # - name: 🧪 Generate coverage
+      #   if: steps.creds.outputs.present == 'true'
+      #   run: pnpm test:coverage || true
+
+      # PR analysis relies on the community-branch-plugin on the server
+      - name: 📡 Scan (PR analysis)
+        if: steps.creds.outputs.present == 'true' && github.event_name == 'pull_request'
+        uses: sonarsource/sonarqube-scan-action@v8.2.0 # nosemgrep: generic.secrets.security.detected-sonarqube-docs-api-key.detected-sonarqube-docs-api-key
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+            -Dsonar.pullrequest.key=${{ github.event.pull_request.number }}
+            -Dsonar.pullrequest.branch=${{ github.head_ref }}
+            -Dsonar.pullrequest.base=${{ github.base_ref }}
+            -Dsonar.qualitygate.wait=false
+
+      - name: 📡 Scan (branch analysis)
+        if: steps.creds.outputs.present == 'true' && github.event_name != 'pull_request'
+        uses: sonarsource/sonarqube-scan-action@v8.2.0 # nosemgrep: generic.secrets.security.detected-sonarqube-docs-api-key.detected-sonarqube-docs-api-key
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+            -Dsonar.branch.name=${{ github.ref_name }}
+            -Dsonar.qualitygate.wait=false
+
+      # Sticky PR comment (updated in place, not re-posted) with the findings
+      - name: 💬 Comment findings on PR
+        if: always() && github.event_name == 'pull_request' && steps.creds.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # The scan step no longer waits on sonar.qualitygate.wait, so the gate
+          # may still be computing server-side when this step starts — poll
+          # briefly instead of a single immediate check.
+          GATE="UNAVAILABLE"
+          for _ in $(seq 1 12); do
+            if RESP=$(curl -sf -u "$SONAR_TOKEN:" \
+              "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY&pullRequest=$PR_NUMBER"); then
+              GATE=$(echo "$RESP" | jq -r '.projectStatus.status // "NONE"')
+              [ "$GATE" != "NONE" ] && break
+            fi
+            sleep 5
+          done
+
+          ISSUES_FILE=$(mktemp)
+          if ! curl -sf -u "$SONAR_TOKEN:" \
+            "$SONAR_HOST_URL/api/issues/search?components=$SONAR_PROJECT_KEY&pullRequest=$PR_NUMBER&resolved=false&ps=100" \
+            > "$ISSUES_FILE"; then
+            echo "::warning::SonarQube API unavailable — skipping PR comment"
+            exit 0
+          fi
+
+          case "$GATE" in
+            OK)    GATE_LINE="✅ Quality gate: **пройдено**" ;;
+            ERROR) GATE_LINE="❌ Quality gate: **не пройдено**" ;;
+            *)     GATE_LINE="ℹ️ Quality gate: $GATE" ;;
+          esac
+
+          BODY_FILE=$(mktemp)
+          {
+            echo "<!-- sonarqube-report -->"
+            echo "## 📡 SonarQube — якість коду"
+            echo ""
+            echo "$GATE_LINE"
+            echo ""
+            jq -r --arg key "$SONAR_PROJECT_KEY" '
+              (.issues // []) as $i
+              | if ($i | length) == 0 then
+                  "✅ Зауважень у змінених файлах немає."
+                else
+                  ( $i | sort_by({BLOCKER:0, CRITICAL:1, MAJOR:2, MINOR:3, INFO:4}[.severity] // 5) ) as $s
+                  | "Знайдено **\($s | length)** зауважень:\n\n" +
+                    "| Серйозність | Файл | Зауваження |\n|---|---|---|\n" +
+                    ( [ $s[:20][] | "| \(.severity) | `\(.component | sub("^" + $key + ":"; ""))\(if .line then ":\(.line)" else "" end)` | \(.message | gsub("\\|"; "\\\\|")) |" ] | join("\n") ) +
+                    (if ($s|length) > 20 then "\n\n…і ще \(($s|length)-20) зауважень — повний список у SonarQube." else "" end)
+                end
+            ' "$ISSUES_FILE"
+            echo ""
+            echo "_Повний звіт: [SonarQube]($SONAR_HOST_URL/dashboard?id=$SONAR_PROJECT_KEY&pullRequest=$PR_NUMBER) · [лог запуску]($RUN_URL)_"
+          } > "$BODY_FILE"
+
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" --paginate \
+            --jq '[.[] | select(.body | startswith("<!-- sonarqube-report -->"))][0].id // empty')
+          if [ -n "$COMMENT_ID" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$COMMENT_ID" -F body=@"$BODY_FILE" > /dev/null
+            echo "Updated existing SonarQube comment (id=$COMMENT_ID)"
+          else
+            gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" -F body=@"$BODY_FILE" > /dev/null
+            echo "Posted new SonarQube comment"
+          fi
