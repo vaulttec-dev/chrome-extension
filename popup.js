@@ -9,6 +9,53 @@ function refresh() {
 
 refresh();
 
+// ---- Диктофон (запис + транскрипція) ----
+// Кнопка живе тут, а не плаваючою на кожному сайті. Попап Chrome знищує при
+// закритті, тож жодного локального стану: усе малюється зі storage (dictPhase /
+// dictLast), який веде background. Наслідок — вікно можна сміливо закрити посеред
+// запису, а offscreen кладе транскрипт у буфер незалежно від попапа.
+const dictBtn = document.getElementById('dict');
+const dictStateEl = document.getElementById('dictstate');
+
+function renderDict(phase, last) {
+  const ph = phase || 'idle';
+  dictBtn.classList.toggle('rec', ph === 'recording');
+  dictBtn.classList.toggle('busy', ph === 'busy');
+  dictBtn.disabled = ph === 'busy';
+  dictBtn.textContent = ph === 'recording'
+    ? '⏹ Зупинити й розшифрувати'
+    : ph === 'busy'
+      ? '⏳ Розшифровую…'
+      : '🎤 Почати диктування';
+
+  let text;
+  let err = false;
+  if (ph === 'recording') text = '● Запис… говоріть. Вікно можна закрити — запис триває.';
+  else if (ph === 'busy') text = 'Gemini розшифровує аудіо…';
+  else if (last && last.ok) text = last.len ? `✓ Скопійовано ${last.len} симв. — вставте через Ctrl+V.` : 'Порожньо — мовлення не розпізнано.';
+  else if (last && last.error) { text = '⚠ ' + last.error; err = true; }
+  else text = 'Клік — запис, ще клік — транскрипт у буфері обміну.';
+  dictStateEl.textContent = text;
+  dictStateEl.classList.toggle('err', err);
+}
+
+function refreshDict() {
+  chrome.storage.local.get(['dictPhase', 'dictLast'])
+    .then(({ dictPhase, dictLast }) => renderDict(dictPhase, dictLast));
+}
+
+refreshDict();
+
+dictBtn.addEventListener('click', () => {
+  // Оптимістично перемикаємо вигляд, щоб кнопка відгукнулась миттєво; справжній
+  // стан однаково прилетить зі storage — і зараз, і при наступному відкритті.
+  const wasRecording = dictBtn.classList.contains('rec');
+  renderDict(wasRecording ? 'busy' : 'recording', null);
+  chrome.storage.local.get('geminiApiKey')
+    .then(({ geminiApiKey }) => chrome.runtime.sendMessage({ target: 'bg', type: 'DICT_TOGGLE', key: geminiApiKey }))
+    .catch(() => { /* попап закрили — background доведе справу до кінця сам */ });
+});
+
 // ---- Якість відео ----
 // «Авто» = замір швидкості кодування на старті запису (див. content.js): вища
 // роздільність вмикається лише там, де машина витягне її без дропу кадрів.
@@ -106,4 +153,5 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
   if (changes.logs) renderLog(changes.logs.newValue);
   if (changes.isRecording || changes.lastStatus) refresh();
+  if (changes.dictPhase || changes.dictLast) refreshDict();
 });

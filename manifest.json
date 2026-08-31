@@ -14,12 +14,6 @@
       "js": ["logstore.js", "recstore.js", "gdrive.js", "gemini.js", "content.js"],
       "css": ["content.css"],
       "run_at": "document_idle"
-    },
-    {
-      "matches": ["<all_urls>"],
-      "js": ["dictation.js"],
-      "css": ["dictation.css"],
-      "run_at": "document_idle"
     }
   ],
   "background": { "service_worker": "background.js" },

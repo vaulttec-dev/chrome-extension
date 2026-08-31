@@ -106,13 +106,16 @@ async function closeOffscreen() {
   } catch (_) { /* уже закритий */ }
 }
 
-// Синхронізуємо вигляд кнопки в усіх вкладках (запис могли зупинити з іншої вкладки/клавішею).
-function broadcastDict(recording) {
-  chrome.tabs.query({}, (tabs) => {
-    for (const t of tabs) {
-      if (t.id != null) chrome.tabs.sendMessage(t.id, { target: 'content', type: 'DICT_STATE', recording }, () => void chrome.runtime.lastError);
-    }
-  });
+// Стан диктофона для інтерфейсу (попап) — у storage, а не повідомленням у вкладки.
+// Кнопка живе в попапі, який Chrome знищує при кожному закритті, тож єдине надійне
+// джерело правди — storage: попап перемальовується з нього при відкритті й через
+// storage.onChanged, поки відкритий.
+//   phase: 'idle' | 'recording' | 'busy' (йде транскрипція)
+//   last:  підсумок останньої спроби — { ok, len } або { ok:false, error }
+function setDictUi(phase, last) {
+  const patch = { dictPhase: phase };
+  if (last !== undefined) patch.dictLast = last;
+  return chrome.storage.local.set(patch).catch(() => {});
 }
 
 async function handleDictToggle(msg, sendResponse) {
@@ -123,40 +126,56 @@ async function handleDictToggle(msg, sendResponse) {
     if (!dictRecording) {
       // ---- СТАРТ ----
       const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
-      if (!geminiApiKey) { sendResponse({ ok: false, error: 'Немає Gemini API-ключа — додайте його в попапі розширення.' }); return; }
+      if (!geminiApiKey) {
+        const error = 'Немає Gemini API-ключа — додайте його нижче в цьому вікні.';
+        await setDictUi('idle', { ok: false, error });
+        sendResponse({ ok: false, error });
+        return;
+      }
       await ensureOffscreen();
       const res = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'start' });
       if (res && res.ok) {
         await chrome.storage.local.set({ dictRecording: true });
-        broadcastDict(true);
+        await setDictUi('recording', null);
         sendResponse({ ok: true, recording: true });
       } else {
         if (res && res.code === 'mic') chrome.tabs.create({ url: chrome.runtime.getURL('mic.html') });
         await closeOffscreen();
-        sendResponse({ ok: false, code: res && res.code, error: (res && res.error) || 'не вдалося почати запис' });
+        const error = (res && res.error) || 'не вдалося почати запис';
+        await setDictUi('idle', {
+          ok: false,
+          error: res && res.code === 'mic'
+            ? 'Надайте доступ до мікрофона у вкладці, що відкрилась, і спробуйте знову.'
+            : error
+        });
+        sendResponse({ ok: false, code: res && res.code, error });
       }
     } else {
       // ---- СТОП + транскрипція. Мікрофон звільняє САМ offscreen через track.stop()
       // (як роблять Zed/VS Code). Документ НЕ закриваємо: закриття offscreen лишає
       // застряглі privacy-іконки в COSMIC. Idle-документ без активного треку індикатора не дає.
+      await chrome.storage.local.set({ dictRecording: false });
+      await setDictUi('busy');
       let res;
       try { res = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'stop', key: msg.key }); }
       catch (e) { res = { ok: false, error: e.message }; }
-      await chrome.storage.local.set({ dictRecording: false });
-      broadcastDict(false);
       if (res && res.ok) {
-        MRLog.log('info', 'dict', res.text ? ('Транскрипт скопійовано (' + res.text.length + ' симв.)') : 'Порожньо — мовлення не розпізнано');
+        const len = (res.text || '').length;
+        MRLog.log('info', 'dict', len ? ('Транскрипт скопійовано (' + len + ' симв.)') : 'Порожньо — мовлення не розпізнано');
+        await setDictUi('idle', { ok: true, len });
         sendResponse({ ok: true, recording: false, text: res.text });
       } else {
-        MRLog.log('error', 'dict', (res && res.error) || 'offscreen не відповів');
-        sendResponse({ ok: false, recording: false, error: (res && res.error) || 'помилка транскрипції' });
+        const error = (res && res.error) || 'offscreen не відповів';
+        MRLog.log('error', 'dict', error);
+        await setDictUi('idle', { ok: false, error });
+        sendResponse({ ok: false, recording: false, error });
       }
     }
   } catch (e) {
     // Offscreen НЕ закриваємо: постійний потік мікрофона = одна стабільна трей-іконка
     // (часті open/close засмічують трей COSMIC мертвими записами).
     await chrome.storage.local.set({ dictRecording: false }).catch(() => {});
-    broadcastDict(false);
+    await setDictUi('idle', { ok: false, error: e.message });
     sendResponse({ ok: false, error: e.message });
   } finally {
     dictBusy = false;

@@ -26,6 +26,14 @@
         cursor: pointer;
       }
       #savekey { background: #1a73e8; color: #fff; }
+      #dict { background: #1a73e8; color: #fff; font-weight: 500; }
+      #dict.rec { background: #d93025; animation: dictpulse 1.4s ease-in-out infinite; }
+      #dict.busy { background: #5f6368; cursor: default; }
+      @keyframes dictpulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(217, 48, 37, 0.45); }
+        60%      { box-shadow: 0 0 0 7px rgba(217, 48, 37, 0); }
+      }
+      #dictstate.err { color: #c5221f; }
       .hint { font-size: 12px; color: #80868b; margin: 10px 0 0; }
       hr { border: 0; border-top: 1px solid #eceff1; margin: 14px 0 10px; }
       .ghdr { display: block; font-size: 13px; font-weight: 500; margin: 0 0 6px; }
@@ -70,6 +78,11 @@
   <body>
     <h1>Запис Meet → Drive</h1>
     <p id="status">—</p>
+
+    <hr />
+    <span class="ghdr">Диктофон → транскрипт у буфер</span>
+    <button id="dict">🎤 Почати диктування</button>
+    <p id="dictstate" class="hint"></p>
 
     <hr />
     <label class="ghdr" for="quality">Якість відео</label>

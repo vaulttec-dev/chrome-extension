@@ -32,8 +32,7 @@ content script'у OAuth-токен (бо `chrome.identity` доступний л
 | `content.js` / `content.css` | Кнопка в Meet, детекція дзвінка, захоплення (`getDisplayMedia` + мікрофон), `MediaRecorder`, аплоад відео й страхового аудіо на Drive (або локально) і заливання аудіо в Gemini. |
 | `gdrive.js` / `gemini.js` | Чисті функції Drive / Gemini (приймають токен/ключ) — спільні для content script і service worker, без дублювання. |
 | `background.js` | OAuth-токен для content script, фоновий конспект через `chrome.alarms` (Files API → `generateContent` → Google Doc / `.txt`) з ретраями до дедлайну та перезаливкою аудіо з Drive; стан диктофона. |
-| `popup.html` / `popup.js` | Статус, якість відео, Gemini-ключ, повноцінні логи. |
-| `dictation.js` / `dictation.css` | Плаваюча кнопка 🎤 на будь-якому сайті: клік — запис, клік — транскрипт у буфер. |
+| `popup.html` / `popup.js` | Статус, кнопка диктофона 🎤 (запис → транскрипт у буфер), якість відео, Gemini-ключ, повноцінні логи. |
 | `offscreen.html` / `offscreen.js` | Невидимий документ розширення: тримає мікрофон диктофона, транскрибує через Gemini, копіює текст у буфер. |
 | `mic.html` / `mic.js` | Одноразовий запит дозволу мікрофона для диктофона. |
 | `icons/` | Іконки (червона крапка). |
