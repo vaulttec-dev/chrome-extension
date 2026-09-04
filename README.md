@@ -29,7 +29,7 @@ content script'у OAuth-токен (бо `chrome.identity` доступний л
 | Файл | Роль |
 |------|------|
 | `manifest.json` | Дозволи (`identity`, `storage`, `downloads`, `alarms`, `offscreen`, `clipboardWrite`), OAuth, реєстрація скриптів. |
-| `content.js` / `content.css` | Кнопка в Meet, детекція дзвінка, захоплення (`getDisplayMedia` + мікрофон), `MediaRecorder`, аплоад відео й страхового аудіо на Drive (або локально) і заливання аудіо в Gemini. |
+| `content.js` / `content.css` | Кнопка в Meet, детекція дзвінка, захоплення (`getDisplayMedia` + мікрофон), `MediaRecorder`, аплоад відео й аудіо-доріжки на Drive (або локально) і заливання аудіо в Gemini. |
 | `gdrive.js` / `gemini.js` | Чисті функції Drive / Gemini (приймають токен/ключ) — спільні для content script і service worker, без дублювання. |
 | `background.js` | OAuth-токен для content script, фоновий конспект через `chrome.alarms` (Files API → `generateContent` → Google Doc / `.txt`) з ретраями до дедлайну та перезаливкою аудіо з Drive; стан диктофона. |
 | `popup.html` / `popup.js` | Статус, кнопка диктофона 🎤 (запис → транскрипт у буфер), якість відео, Gemini-ключ, повноцінні логи. |
@@ -39,10 +39,15 @@ content script'у OAuth-токен (бо `chrome.identity` доступний л
 
 Потік конспекту: клік «● Запис» → `getDisplayMedia({preferCurrentTab})` + `getUserMedia` (мікрофон) →
 мікс аудіо → `MediaRecorder` (WebM) → на стоп `content.js` бере токен у `background.js`,
-вантажить відео на Drive (інакше локально), зберігає туди ж страхову аудіо-доріжку, заливає
-аудіо в Gemini й передає `background.js` дрібну задачу — той по `chrome.alarms` чекає обробки,
-генерує конспект і кладе Google Документом у ту саму теку. Якщо копія в Gemini протухла
-(~48 год) — сам перезаливає аудіо з Drive; після успішного конспекту страхове аудіо видаляє.
+вантажить відео на Drive (інакше локально), зберігає туди ж аудіо-доріжку, заливає
+аудіо в Gemini й передає `background.js` дрібну задачу — той по `chrome.alarms` чекає обробки
+і робить два кроки: (1) **повний транскрипт** спеціалізованою моделлю `gemini-3.5-transcribe`
+(Interactions API; запис довший за 1 год або порожня відповідь → запасний шлях через
+`gemini-flash-latest` із промптом дослівної розшифровки) → Google Документ «— транскрипт»;
+(2) **конспект** уже з цього тексту (`gemini-flash-latest`) → Google Документ «— конспект»,
+тека перейменовується за темою. У теці зустрічі лишаються чотири файли: відео, аудіо,
+транскрипт, конспект. Якщо копія аудіо в Gemini протухла (~48 год) до транскрипту — сам
+перезаливає її з Drive.
 
 ---
 

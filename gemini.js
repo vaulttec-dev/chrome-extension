@@ -1,17 +1,19 @@
 // gemini.js — чисті функції Gemini (приймають API-ключ аргументом).
-// Розподіл: великий аплоад відео (geminiUploadFile) робить content script —
-// щоб blob не йшов через sendMessage; дрібні запити (geminiGetFile, geminiGenerate)
-// веде service worker через chrome.alarms, незалежно від вкладки Meet.
+// Розподіл: великий аплоад аудіо (geminiUploadFile) робить content script —
+// щоб blob не йшов через sendMessage; решту (geminiGetFile, geminiTranscribeFile,
+// geminiSummarize) веде service worker через chrome.alarms, незалежно від вкладки Meet.
+// Конвеєр зустрічі — два кроки: аудіо → ПОВНИЙ транскрипт (спеціалізована модель),
+// потім транскрипт → конспект (звичайна flash-модель). Обидва — окремі файли в теці.
 (function (g) {
   // Аліас «-latest» завжди вказує на найновішу flash-модель — код не треба оновлювати
-  // з виходом нових версій (конспекти й диктофон використовують цю саму константу).
+  // з виходом нових версій (конспект і запасна транскрипція використовують цю константу).
   const GEMINI_MODEL = 'gemini-flash-latest';
   const GEMINI_PROMPT = `Ти — досвідчений асистент із протоколювання робочих зустрічей.
-Тобі дано АУДІОЗАПИС зустрічі Google Meet. Спирайся ВИКЛЮЧНО на те, що РЕАЛЬНО СКАЗАНО вголос,
-уважно «прослухай» увесь запис від початку до кінця і не пропусти жодної важливої деталі.
+Вище дано ПОВНИЙ ТРАНСКРИПТ зустрічі Google Meet — дослівну розшифровку аудіозапису.
+Спирайся ВИКЛЮЧНО на те, що є в транскрипті, уважно прочитай його від початку до кінця
+і не пропусти жодної важливої деталі.
 
-Спершу подумки зроби ПОВНУ розшифровку всього мовлення, а потім на її основі склади
-ДЕТАЛЬНИЙ конспект УКРАЇНСЬКОЮ у форматі Markdown.
+На основі транскрипту склади ДЕТАЛЬНИЙ конспект УКРАЇНСЬКОЮ у форматі Markdown.
 
 ПЕРШИЙ рядок відповіді — СЛУЖБОВИЙ, рівно у форматі «ТЕМА: <до 5 слів українською>»:
 коротка назва зустрічі по суті (напр. «ТЕМА: Бюджет реклами на липень»). Без лапок, без крапки
@@ -48,7 +50,7 @@
 шкалою «хто коли говорив». Якщо впевненості, хто говорить, немає — НЕ вгадуй: пиши
 «(мовця не визначено)», а виконавця завдання познач «—».
 
-Якщо в записі реально немає мовлення або воно нерозбірливе — прямо так і напиши.
+Якщо транскрипт порожній або беззмістовний (мовлення не було чи не розпізналось) — прямо так і напиши.
 НІКОЛИ не повторюй той самий символ, слово чи речення поспіль і не додавай тексту-заповнювача;
 якщо змісту мало — конспект короткий, і це нормально. Пиши українською, конкретно; нічого
 важливого не вигадуй і не пропускай.`;
@@ -115,9 +117,97 @@
     return r.json();
   }
 
-  // Згенерувати конспект із завантаженого файлу. context — необов'язковий текстовий блок
-  // зі списком учасників та шкалою «хто коли говорив» (його збирає content script з DOM Meet).
-  async function geminiGenerate(fileUri, mimeType, key, context) {
+  // Розібрати відповідь generateContent → { text, finishReason }.
+  // finishReason: 'STOP' норм; 'MAX_TOKENS'/'SAFETY'/… = вивід обрізано.
+  function pickCandidateText(d) {
+    const cand = d && d.candidates && d.candidates[0];
+    const parts = cand && cand.content && cand.content.parts;
+    const finishReason = cand && cand.finishReason;
+    const text = parts ? parts.map((p) => p.text).filter(Boolean).join('\n').trim() : '';
+    return { text, finishReason };
+  }
+
+  // Конспект із ГОТОВОГО транскрипту (текст → текст). Аудіо сюди більше не йде: дослівну
+  // розшифровку робить окрема модель (geminiTranscribeFile), а конспект — уже з неї, тож
+  // спирається на повний текст, а не на те, що модель «дочула». context — необов'язковий
+  // блок зі списком учасників і шкалою «хто коли говорив» (збирає content script з DOM Meet).
+  // Транскрипт ставимо ПЕРЕД інструкцією: для довгого контексту Gemini краще тримає
+  // завдання, коли воно йде після даних.
+  async function geminiSummarize(transcript, key, context) {
+    const prompt = '===== ТРАНСКРИПТ ЗУСТРІЧІ =====\n' + transcript + '\n===== КІНЕЦЬ ТРАНСКРИПТУ =====\n\n' +
+      GEMINI_PROMPT + (context ? '\n\n' + context : '');
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: 'POST',
+        headers: { 'x-goog-api-key': key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.6, maxOutputTokens: 24576 }
+        })
+      }
+    );
+    if (!r.ok) {
+      const t = await r.text().catch(() => '');
+      throw new Error('gemini generate ' + r.status + ' ' + t.slice(0, 200));
+    }
+    const { text, finishReason } = pickCandidateText(await r.json());
+    if (!text) throw new Error('gemini: порожня відповідь' + (finishReason ? ' (finishReason: ' + finishReason + ')' : ''));
+    return { text, finishReason };
+  }
+
+  // ---- Транскрипція: спеціалізована модель Gemini 3.5 Transcribe ----
+  // Це ОКРЕМИЙ Interactions API (POST /v1beta/interactions), а не generateContent: без
+  // промпту, модель віддає лише текст розшифровки (85+ мов, пунктуація, форматування).
+  // Ліміт — до 1 год аудіо на запит. Довший запис, помилка формату/доступу (4xx) чи порожня
+  // відповідь → запасний шлях через звичайну flash-модель із промптом дослівної розшифровки:
+  // вона тягне й багатогодинне аудіо, тож транскрипт НІКОЛИ не лишається без результату.
+  const GEMINI_TRANSCRIBE_MODEL = 'gemini-3.5-transcribe';
+  const TRANSCRIBE_MAX_MS = 60 * 60 * 1000;
+
+  const GEMINI_TRANSCRIBE_PROMPT = `Розшифруй це аудіо у звичайний текст — ПОВНІСТЮ, від початку до кінця.
+Поверни ВИКЛЮЧНО дослівний транскрипт сказаного тією ж мовою, якою говорять
+(українською — українською). Без жодних коментарів, заголовків, лапок чи пояснень.
+Розстав природну пунктуацію та великі літери; зміну мовця познач новим абзацом.
+Прибери слова-паразити й повтори-запинки лише якщо вони явно випадкові.
+Нічого не скорочуй і не підсумовуй. Якщо мовлення немає — поверни порожній рядок.`;
+
+  // Текст із відповіді Interactions API. REST віддає поле в camelCase (outputText), SDK
+  // показує output_text; про всяк випадок збираємо ще й із кроків (steps[].content[].text).
+  function pickInteractionText(d) {
+    if (!d) return '';
+    if (typeof d.outputText === 'string') return d.outputText.trim();
+    if (typeof d.output_text === 'string') return d.output_text.trim();
+    const steps = Array.isArray(d.steps) ? d.steps : Array.isArray(d.outputs) ? d.outputs : [];
+    const parts = [];
+    for (const s of steps) {
+      const content = Array.isArray(s && s.content) ? s.content : [];
+      for (const c of content) if (c && typeof c.text === 'string') parts.push(c.text);
+    }
+    return parts.join('\n').trim();
+  }
+
+  async function transcribeViaInteractions(fileUri, mimeType, key) {
+    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+      method: 'POST',
+      headers: { 'x-goog-api-key': key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: GEMINI_TRANSCRIBE_MODEL,
+        input: [{ type: 'audio', uri: fileUri, mime_type: mimeType }]
+      })
+    });
+    if (!r.ok) {
+      const t = await r.text().catch(() => '');
+      const err = new Error('gemini transcribe ' + r.status + ' ' + t.slice(0, 200));
+      err.status = r.status;
+      throw err;
+    }
+    return pickInteractionText(await r.json());
+  }
+
+  // Запасний шлях: звичайна модель + промпт дослівної розшифровки. 65k токенів виводу
+  // вистачає на ~4 год мовлення; якщо обріжеться — finishReason скаже (MAX_TOKENS).
+  async function transcribeViaGenerate(fileUri, mimeType, key) {
     const r = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
       {
@@ -126,40 +216,50 @@
         body: JSON.stringify({
           contents: [{
             parts: [
-              { file_data: { mime_type: mimeType || 'video/webm', file_uri: fileUri } },
-              { text: context ? GEMINI_PROMPT + '\n\n' + context : GEMINI_PROMPT }
+              { file_data: { mime_type: mimeType, file_uri: fileUri } },
+              { text: GEMINI_TRANSCRIBE_PROMPT }
             ]
           }],
-          generationConfig: {
-            mediaResolution: 'MEDIA_RESOLUTION_LOW',
-            temperature: 0.6,
-            maxOutputTokens: 24576
-          }
+          generationConfig: { temperature: 0.2, maxOutputTokens: 65536 }
         })
       }
     );
     if (!r.ok) {
       const t = await r.text().catch(() => '');
-      throw new Error('gemini generate ' + r.status + ' ' + t.slice(0, 200));
+      throw new Error('gemini transcribe (fallback) ' + r.status + ' ' + t.slice(0, 200));
     }
-    const d = await r.json();
-    const cand = d && d.candidates && d.candidates[0];
-    const parts = cand && cand.content && cand.content.parts;
-    const finishReason = cand && cand.finishReason; // 'STOP' норм; 'MAX_TOKENS'/'SAFETY'/… = обрізано
-    const text = parts ? parts.map((p) => p.text).filter(Boolean).join('\n').trim() : '';
-    if (!text) throw new Error('gemini: порожня відповідь' + (finishReason ? ' (finishReason: ' + finishReason + ')' : ''));
-    return { text, finishReason };
+    return pickCandidateText(await r.json());
   }
 
-  // ---- Диктофон: дослівна транскрипція короткого аудіо ----
-  const GEMINI_TRANSCRIBE_PROMPT = `Розшифруй це аудіо у звичайний текст.
-Поверни ВИКЛЮЧНО дослівний транскрипт сказаного тією ж мовою, якою говорять
-(українською — українською). Без жодних коментарів, заголовків, лапок чи пояснень.
-Розстав природну пунктуацію та великі літери. Прибери слова-паразити й повтори-запинки
-лише якщо вони явно випадкові. Якщо мовлення немає — поверни порожній рядок.`;
+  // Повна розшифровка вже залитого (ACTIVE) файлу → { text, model, finishReason }.
+  // durationMs — тривалість запису, якщо відома (null → одразу пробуємо спеціалізовану модель).
+  // onFallback(why) — колбек для логу, коли перемикаємось на запасну модель.
+  // Мережа / 429 / 5xx НЕ перехоплюються — кидаємо далі, черга повторить пізніше.
+  async function geminiTranscribeFile(fileUri, mimeType, key, durationMs, onFallback) {
+    const mime = (mimeType || 'audio/webm').split(';')[0];
+    const tooLong = durationMs != null && durationMs > TRANSCRIBE_MAX_MS;
+    if (tooLong) {
+      if (onFallback) onFallback('запис довший за 1 год — понад ліміт спеціалізованої моделі');
+    } else {
+      try {
+        const text = await transcribeViaInteractions(fileUri, mime, key);
+        if (text) return { text, model: GEMINI_TRANSCRIBE_MODEL, finishReason: 'STOP' };
+        if (onFallback) onFallback('спеціалізована модель повернула порожній транскрипт');
+      } catch (e) {
+        // 4xx (крім 429 «ліміт запитів») — запит або аудіо модель не приймає: повтори не
+        // допоможуть, тож не чекаємо 46 год, а йдемо запасним шляхом одразу.
+        const s = e && e.status;
+        if (!(s >= 400 && s < 500 && s !== 429)) throw e;
+        if (onFallback) onFallback((e && e.message) || String(e));
+      }
+    }
+    const { text, finishReason } = await transcribeViaGenerate(fileUri, mime, key);
+    return { text, model: GEMINI_MODEL, finishReason };
+  }
 
-  // Короткий аудіоблоб → дослівний текст. Через Files API (той самий надійний шлях,
-  // що й конспект): resumable-аплоад → коротке очікування ACTIVE → generate.
+  // ---- Диктофон: короткий аудіоблоб → текст ----
+  // Той самий шлях, що й у зустрічі: resumable-аплоад у Files API → коротке очікування
+  // ACTIVE → geminiTranscribeFile (спеціалізована модель із запасним шляхом).
   // onWait — необовʼязковий колбек статусу (напр., щоб оновити тост «обробка…»).
   async function geminiTranscribe(blob, key, onWait) {
     const mime = (blob.type || 'audio/webm').split(';')[0];
@@ -174,31 +274,12 @@
     if (file.state === 'FAILED') throw new Error('Gemini не зміг обробити аудіо');
     if (file.state === 'PROCESSING') throw new Error('Gemini надто довго обробляє аудіо');
 
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-      {
-        method: 'POST',
-        headers: { 'x-goog-api-key': key, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              { file_data: { mime_type: mime, file_uri: file.uri } },
-              { text: GEMINI_TRANSCRIBE_PROMPT }
-            ]
-          }],
-          generationConfig: { temperature: 0.2, maxOutputTokens: 8192 }
-        })
-      }
-    );
-    if (!r.ok) {
-      const t = await r.text().catch(() => '');
-      throw new Error('gemini transcribe ' + r.status + ' ' + t.slice(0, 200));
-    }
-    const d = await r.json();
-    const cand = d && d.candidates && d.candidates[0];
-    const parts = cand && cand.content && cand.content.parts;
-    return parts ? parts.map((p) => p.text).filter(Boolean).join('\n').trim() : '';
+    const { text } = await geminiTranscribeFile(file.uri, file.mimeType || mime, key, null);
+    return text;
   }
 
-  g.Gemini = { GEMINI_MODEL, GEMINI_PROMPT, splitTopic, geminiUploadFile, geminiGetFile, geminiGenerate, geminiTranscribe };
+  g.Gemini = {
+    GEMINI_MODEL, GEMINI_TRANSCRIBE_MODEL, GEMINI_PROMPT, splitTopic,
+    geminiUploadFile, geminiGetFile, geminiTranscribeFile, geminiSummarize, geminiTranscribe
+  };
 })(globalThis);

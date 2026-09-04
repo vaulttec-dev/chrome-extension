@@ -78,11 +78,12 @@ function download(url, filename) {
   });
 }
 
-// ---- Диктофон: offscreen (мікрофон + Gemini + буфер) з ЄДИНИМ станом у SW ----
-// Content script не має доступу до chrome.offscreen, тож документ створює/закриває SW.
-// Стан запису — у storage (storage.local.dictRecording), щоб пережити засинання SW під
-// час довгого запису. offscreen один на все розширення, тож другий getUserMedia неможливий,
-// поки йде запис (жодних «зомбі-мікрофонів»).
+// ---- Диктофон: offscreen (мікрофон + Gemini + буфер) ----
+// Документ створює SW (chrome.offscreen недоступний ні content script, ні попапу).
+// Джерело правди про «чи йде запис» — САМ offscreen (там живе MediaRecorder); storage —
+// лише кеш для миттєвого малювання попапа, і перед кожною дією їх звіряє syncDictState.
+// offscreen один на все розширення, тож другий getUserMedia неможливий, поки йде запис
+// (жодних «зомбі-мікрофонів»).
 let dictBusy = false; // серіалізуємо toggle, щоб клік+клавіша не наклалися
 let offscreenCreating = null;
 
@@ -118,12 +119,51 @@ function setDictUi(phase, last) {
   return chrome.storage.local.set(patch).catch(() => {});
 }
 
+// Справжній стан питаємо в offscreen: MediaRecorder живе ТІЛЬКИ там. Записи в storage
+// переживають і перезапуск service worker, і перезавантаження розширення, а сам запис —
+// ні, тож довіряти кешу не можна: саме через це кнопка залипала («offscreen не відповів»
+// на першому ж кліку або вічне «Розшифровую…» з неактивною кнопкою).
+async function readDictTruth() {
+  const ctxs = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+  if (!ctxs.length) return false;
+  try {
+    const r = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'state' });
+    return !!(r && r.recording);
+  } catch (_) {
+    return false; // документ є, але скрипт ще/вже не слухає — записом це не вважаємо
+  }
+}
+
+// Звіряє кеш із реальністю й повертає фактичну фазу. Викликається і при відкритті
+// попапа, і перед кожним перемиканням — тож будь-яке залипання лікується самé.
+async function syncDictState() {
+  const recording = await readDictTruth();
+  const { dictRecording, dictPhase } = await chrome.storage.local.get(['dictRecording', 'dictPhase']);
+
+  if (recording) {
+    if (!dictRecording || dictPhase !== 'recording') {
+      await chrome.storage.local.set({ dictRecording: true });
+      await setDictUi('recording');
+    }
+    return 'recording';
+  }
+  // «busy» правдиве лише поки транскрипцію веде ЖИВИЙ service worker: dictBusy — змінна
+  // в пам'яті SW, тож після його перезапуску вона сама по собі false, і фаза розлипає.
+  if (dictBusy && dictPhase === 'busy') return 'busy';
+  if (dictRecording || dictPhase === 'recording' || dictPhase === 'busy') {
+    await chrome.storage.local.set({ dictRecording: false });
+    await setDictUi('idle', { ok: false, error: 'Попередній запис обірвався (розширення перезапустилось). Спробуйте ще раз.' });
+    MRLog.log('warn', 'dict', 'Скинуто застряглий стан диктофона: ' + (dictPhase || 'recording'));
+  }
+  return 'idle';
+}
+
 async function handleDictToggle(msg, sendResponse) {
   if (dictBusy) { sendResponse({ ok: false, error: 'зачекайте — обробляю попередню дію' }); return; }
   dictBusy = true;
   try {
-    const { dictRecording } = await chrome.storage.local.get('dictRecording');
-    if (!dictRecording) {
+    const recording = await readDictTruth();
+    if (!recording) {
       // ---- СТАРТ ----
       const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
       if (!geminiApiKey) {
@@ -222,6 +262,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       handleDictToggle(msg, sendResponse);
       return true;
 
+    // Попап питає при кожному відкритті: заразом звіряємо кеш із реальністю,
+    // тож застряглий стан («вічне Розшифровую…») розсмоктується сам.
+    case 'DICT_STATE':
+      syncDictState()
+        .then((phase) => chrome.storage.local.get('dictLast').then(({ dictLast }) => sendResponse({ ok: true, phase, last: dictLast })))
+        .catch((e) => sendResponse({ ok: false, phase: 'idle', error: e.message }));
+      return true;
+
     case 'GEMINI_CONTINUE':
       // content залив відео в Gemini → ведемо дрібну обробку у фоні (alarms).
       startGeminiJob(msg.job)
@@ -234,7 +282,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ---- Фонова Gemini-обробка (переживає засинання SW через chrome.alarms) ----
 // Черга завдань у storage.local.geminiJobs — конспекти НЕ перезаписують одне одного,
 // коли накладаються (нова зустріч, поки попередній конспект ще вариться; відновлення).
-// job = { geminiFileName, fileUri, mimeType, docName, meetingBaseName, folderId, ticks, errors }
+// job = { geminiFileName, fileUri, mimeType, meetingBaseName, folderId, speakerContext,
+//         audioDriveId, durationMs, stage: 'transcribe' | 'summarize', transcript, ticks, errors }
+// Два кроки на одну зустріч, по одному на тик: спершу ПОВНИЙ транскрипт (окремий документ),
+// потім конспект уже з цього тексту (ще один документ). Після кроку 1 транскрипт лежить у job,
+// тож конспект ретраїться без Gemini-файлу й без повторної розшифровки.
 
 // Усі read-modify-write черги — через один ланцюжок, щоб push і видалення не губили одне одного.
 let queueChain = Promise.resolve();
@@ -252,10 +304,10 @@ function sameJob(a, b) { return a && b && a.geminiFileName === b.geminiFileName;
 async function startGeminiJob(job) {
   await withQueue(async () => {
     const jobs = await readQueue();
-    jobs.push({ ...job, ticks: 0, errors: 0, createdAt: job.createdAt || Date.now(), nextTryAt: 0 });
+    jobs.push({ ...job, stage: job.stage || 'transcribe', ticks: 0, errors: 0, createdAt: job.createdAt || Date.now(), nextTryAt: 0 });
     await chrome.storage.local.set({ geminiJobs: jobs });
   });
-  setStatus('Роблю конспект через Gemini…');
+  setStatus('Роблю транскрипт через Gemini…');
   await chrome.alarms.create(GEMINI_ALARM, { periodInMinutes: 0.5 });
 }
 
@@ -281,17 +333,8 @@ async function finishJob(job, status, ok) {
   MRLog.log(ok ? 'info' : 'error', 'gemini', status, { rec: job.meetingBaseName });
   setStatus(status);
   notify(ok ? 'Конспект готовий' : 'Конспект: проблема', status);
-
-  // Конспект удався → страхове аудіо в Drive більше не потрібне, прибираємо.
-  // При невдачі аудіо ЛИШАЄМО — це єдине джерело, з якого конспект ще можна зробити.
-  if (ok && job.audioDriveId) {
-    try {
-      await withFreshToken((token) => GDrive.deleteFile(token, job.audioDriveId));
-      MRLog.log('info', 'gemini', 'Страхове аудіо прибрано з Drive', { rec: job.meetingBaseName });
-    } catch (e) {
-      MRLog.log('warn', 'gemini', 'Не вдалося прибрати страхове аудіо з Drive: ' + ((e && e.message) || e), { rec: job.meetingBaseName });
-    }
-  }
+  // Аудіо-доріжку з Drive НЕ прибираємо: вона — постійний член теки зустрічі (відео, аудіо,
+  // транскрипт, конспект) і джерело, з якого транскрипт можна перезробити будь-коли.
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -328,24 +371,57 @@ async function pollGeminiJob() {
     // його в Gemini (свіжі ~46 год) і продовжуємо; без джерела — чесно завершуємо.
     const createdAt = job.createdAt || Date.now();
     if (!job.createdAt) await patchJob(job, { createdAt });
+    const stage = job.stage || 'transcribe';
     if (Date.now() - createdAt > GEMINI_DEADLINE_MS) {
-      if (await tryReuploadFromDrive(job, geminiApiKey)) return;
-      await finishJob(job, 'Конспект не вдалося зробити за 46 год — аудіо в Gemini вже видалено. Відео зустрічі є у Drive.', false);
+      // Файл у Gemini потрібен лише для транскрипту; конспект робиться з тексту в job.
+      if (stage === 'transcribe' && await tryReuploadFromDrive(job, geminiApiKey)) return;
+      await finishJob(job, stage === 'transcribe'
+        ? 'Транскрипт не вдалося зробити за 46 год — аудіо в Gemini вже видалено. Відео й аудіо зустрічі є у Drive.'
+        : 'Конспект не вдалося зробити за 46 год. Транскрипт і відео зустрічі є у Drive.', false);
       return;
     }
 
     try {
-      const file = await Gemini.geminiGetFile(job.geminiFileName, geminiApiKey);
-
-      if (file.state === 'PROCESSING') return; // чекаємо далі — дедлайн і так обмежує
-      if (file.state === 'FAILED') {
-        await finishJob(job, 'Конспект не вдалося зробити: Gemini не обробив аудіо (файл FAILED)', false);
-        return;
+      if (stage === 'transcribe') {
+        // ---- Крок 1: ПОВНИЙ транскрипт → окремий документ у теці ----
+        // Транскрипт міг уже бути в job (SW помер між розшифровкою і збереженням) —
+        // тоді не платимо за повторну розшифровку, лише дозберігаємо.
+        let text = job.transcript || '';
+        if (!text) {
+          const file = await Gemini.geminiGetFile(job.geminiFileName, geminiApiKey);
+          if (file.state === 'PROCESSING') return; // чекаємо далі — дедлайн і так обмежує
+          if (file.state === 'FAILED') {
+            await finishJob(job, 'Транскрипт не вдалося зробити: Gemini не обробив аудіо (файл FAILED)', false);
+            return;
+          }
+          // ACTIVE → спеціалізована модель; для довгих записів чи порожньої відповіді
+          // geminiTranscribeFile сам іде запасним шляхом і каже чому (onFallback → лог).
+          const r = await Gemini.geminiTranscribeFile(
+            file.uri || job.fileUri, file.mimeType || job.mimeType, geminiApiKey, job.durationMs || null,
+            (why) => MRLog.log('warn', 'gemini', 'Транскрипт: перемикаюсь на запасну модель — ' + why, { rec: job.meetingBaseName })
+          );
+          if (looksDegenerate(r.text)) throw new Error('транскрипт виродився (repetition collapse)');
+          if (!r.text) {
+            // Обидві моделі мовчать → у записі, найімовірніше, немає мовлення. Конспект без
+            // змісту не робимо; документ із чесною позначкою лишаємо, щоб тека не «зависла».
+            await saveDoc(job, transcriptDocName(job), 'Мовлення не розпізнано — запис порожній або без звуку.');
+            await finishJob(job, 'Транскрипт порожній: мовлення не розпізнано. Відео й аудіо зустрічі є у Drive.', false);
+            return;
+          }
+          if (r.finishReason && r.finishReason !== 'STOP') MRLog.log('warn', 'gemini', 'Транскрипт обрізано (' + r.finishReason + ') — зберігаю як є', { rec: job.meetingBaseName });
+          text = r.text;
+          MRLog.log('info', 'gemini', 'Транскрипт готовий (' + r.model + ', ' + text.length + ' симв.)', { rec: job.meetingBaseName });
+          await patchJob(job, { transcript: text });
+        }
+        await saveDoc(job, transcriptDocName(job), text);
+        setStatus('Транскрипт готовий ✓ — роблю конспект…');
+        await patchJob(job, { stage: 'summarize', errors: 0, nextTryAt: 0 });
+        return; // конспект — наступним тиком: один тик = одна довга генерація
       }
 
-      // ACTIVE → генеруємо конспект і кладемо у Drive (або локально .txt).
+      // ---- Крок 2: конспект із транскрипту → ще один документ; тека — за темою ----
       const ctx = ((job.speakerContext || '') + (job.retryConcise ? CONCISE_HINT : '')) || null;
-      const { text, finishReason } = await Gemini.geminiGenerate(file.uri || job.fileUri, file.mimeType || job.mimeType, geminiApiKey, ctx);
+      const { text, finishReason } = await Gemini.geminiSummarize(job.transcript || '', geminiApiKey, ctx);
       const truncated = finishReason && finishReason !== 'STOP';
       const degenerate = looksDegenerate(text); // repetition collapse: «UUUU…» замість конспекту
       if ((truncated || degenerate) && !job.retryConcise) {
@@ -359,7 +435,7 @@ async function pollGeminiJob() {
         throw new Error('вивід виродився повторно (repetition collapse)');
       }
       if (truncated) MRLog.log('warn', 'gemini', 'Конспект знову обрізано (' + finishReason + ') — зберігаю як є', { rec: job.meetingBaseName });
-      let status = await saveDoc(job, text);
+      let status = await saveSummary(job, text);
       if (truncated) status += ' (увага: конспект може бути неповним — ' + finishReason + ')';
       await finishJob(job, status, !truncated);
     } catch (e) {
@@ -367,7 +443,7 @@ async function pollGeminiJob() {
       // Файл видалено з Gemini (403/404) — перезаливаємо з Drive-джерела; без нього завершуємо.
       if (/file get (403|404)/.test(msg)) {
         if (await tryReuploadFromDrive(job, geminiApiKey)) return;
-        await finishJob(job, 'Конспект не вдалося зробити: аудіо вже видалено з Gemini. Відео зустрічі є у Drive.', false);
+        await finishJob(job, 'Транскрипт не вдалося зробити: аудіо вже видалено з Gemini. Відео й аудіо зустрічі є у Drive.', false);
         return;
       }
       // Будь-яка інша помилка (мережа, 5xx, ліміти) конспект НЕ вбиває: повтор із
@@ -425,32 +501,49 @@ function looksDegenerate(text) {
   return Math.max(...Object.values(counts)) / total > 0.4;
 }
 
-// Зберегти конспект; повертає статус-рядок. Кидає лише якщо й Drive, і локально не вдалося.
-// Перший рядок відповіді Gemini — службова «ТЕМА: …»: у документ вона не потрапляє,
-// натомість нею перейменовуємо теку зустрічі («Тема — дата час»).
-async function saveDoc(job, raw) {
-  const { topic, text } = Gemini.splitTopic(raw);
+// Імена документів у теці зустрічі: «<база> — транскрипт» і «<база> — конспект».
+// docName лишається для завдань, поставлених у чергу ще старим content script.
+function transcriptDocName(job) { return job.meetingBaseName + ' — транскрипт'; }
+function summaryDocName(job) { return job.docName || (job.meetingBaseName + ' — конспект'); }
+
+// Зберегти текст Google-документом у теку зустрічі; якщо Drive не вдався — локально .txt.
+// Повертає 'drive' | 'local'; кидає лише якщо не вдалося ніяк.
+async function saveDoc(job, name, text) {
   try {
     await withFreshToken(async (token) => {
       const folderId = job.folderId || await GDrive.getMeetingFolderId(token, job.meetingBaseName);
-      await GDrive.createDriveDoc(token, folderId, job.docName, text);
-      // Перейменування — після збереження Doc: якщо воно впаде, конспект уже на місці.
-      const nice = topic && meetingFolderName(topic, job.meetingBaseName);
-      if (nice && nice !== job.meetingBaseName) {
-        try {
-          await GDrive.renameFile(token, folderId, nice);
-          MRLog.log('info', 'save', 'Теку зустрічі перейменовано: ' + nice, { rec: job.meetingBaseName });
-        } catch (e) {
-          MRLog.log('warn', 'save', 'Не вдалося перейменувати теку зустрічі: ' + ((e && e.message) || e), { rec: job.meetingBaseName });
-        }
-      }
+      await GDrive.createDriveDoc(token, folderId, name, text);
     });
-    return 'Конспект готовий ✓ — у теці «Meeting Recordings»';
+    MRLog.log('info', 'save', 'Документ збережено в Drive: ' + name, { rec: job.meetingBaseName });
+    return 'drive';
   } catch (docErr) {
-    MRLog.log('warn', 'gemini', 'Doc у Drive не вдалося, зберігаю локально .txt: ' + ((docErr && docErr.message) || docErr));
-    await download('data:text/plain;charset=utf-8,' + encodeURIComponent(text), job.docName + '.txt');
-    return 'Конспект готовий ✓ — збережено локально (.txt)';
+    MRLog.log('warn', 'gemini', 'Doc «' + name + '» у Drive не вдалося, зберігаю локально .txt: ' + ((docErr && docErr.message) || docErr), { rec: job.meetingBaseName });
+    await download('data:text/plain;charset=utf-8,' + encodeURIComponent(text), name + '.txt');
+    return 'local';
   }
+}
+
+// Зберегти конспект; повертає статус-рядок. Перший рядок відповіді Gemini — службова
+// «ТЕМА: …»: у документ вона не потрапляє, натомість нею перейменовуємо теку зустрічі
+// («Тема — дата час»). Перейменування — ПІСЛЯ збереження: якщо воно впаде, конспект уже на місці.
+async function saveSummary(job, raw) {
+  const { topic, text } = Gemini.splitTopic(raw);
+  const where = await saveDoc(job, summaryDocName(job), text);
+  if (where !== 'drive') return 'Конспект готовий ✓ — збережено локально (.txt)';
+
+  const nice = topic && meetingFolderName(topic, job.meetingBaseName);
+  if (nice && nice !== job.meetingBaseName) {
+    try {
+      await withFreshToken(async (token) => {
+        const folderId = job.folderId || await GDrive.getMeetingFolderId(token, job.meetingBaseName);
+        await GDrive.renameFile(token, folderId, nice);
+      });
+      MRLog.log('info', 'save', 'Теку зустрічі перейменовано: ' + nice, { rec: job.meetingBaseName });
+    } catch (e) {
+      MRLog.log('warn', 'save', 'Не вдалося перейменувати теку зустрічі: ' + ((e && e.message) || e), { rec: job.meetingBaseName });
+    }
+  }
+  return 'Конспект готовий ✓ — транскрипт і конспект у теці «Meeting Recordings»';
 }
 
 // Назва теки зустрічі: «Тема — РРРР-ММ-ДД ГГ-ХХ». Дату й час беремо з базового імені
@@ -470,7 +563,9 @@ chrome.runtime.onStartup.addListener(() => { /* будить SW; переозб�
 // НЕ в top-level: SW прокидається щопівхвилини (тики конспекту, повідомлення), і
 // top-level closeOffscreen убивав би offscreen прямо посеред запису диктофона.
 function resetDictation() {
-  chrome.storage.local.set({ dictRecording: false });
+  // Скидаємо і dictPhase: попап малює кнопку саме з нього, і застрягле 'busy'
+  // (SW помер посеред транскрипції) залишало кнопку назавжди неактивною.
+  chrome.storage.local.set({ dictRecording: false, dictPhase: 'idle' });
   closeOffscreen();
 }
 chrome.runtime.onStartup.addListener(resetDictation);

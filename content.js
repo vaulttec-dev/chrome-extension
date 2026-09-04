@@ -458,6 +458,9 @@
     const audioBlob = id
       ? await RecStore.readBlob(id, 'audio/webm', 'audio')
       : new Blob(audioChunks, { type: 'audio/webm' });
+    // Тривалість — підказка для транскрипції: спеціалізована модель бере до 1 год на запит,
+    // довше background одразу веде запасним шляхом замість того, щоб ловити помилку.
+    const durationMs = recStartMs ? Date.now() - recStartMs : null;
     cleanupStreams();
     isRecording = false;
     render();
@@ -481,7 +484,7 @@
       // в Gemini: закриють вкладку під час аплоаду аудіо — конспект відновиться банером.
       if (id) await RecStore.updateSession(id, { videoSaved: true, folderId: saved.folderId || null })
         .catch((e2) => MRLog.log('warn', 'save', 'updateSession: ' + ((e2 && e2.message) || e2)));
-      const gemOk = await maybeGemini(audioBlob, name, saved.folderId, meta); // ставить власні статуси
+      const gemOk = await maybeGemini(audioBlob, name, saved.folderId, meta, durationMs); // ставить власні статуси
       if (id) {
         if (gemOk) await RecStore.deleteSession(id); // конспект у роботі або свідомо пропущено → журнал не потрібен
         else MRLog.log('warn', 'gemini', 'Аудіо не пішло в Gemini — сесія лишається, конспект можна повторити банером у Meet');
@@ -665,37 +668,38 @@
   // Повертає true, коли повторювати нема чого (конспект запущено або свідомо пропущено),
   // і false, коли аплоад/передача не вдалися — тоді сесію в журналі варто лишити на повтор.
   // meta — блок «учасники + хто коли говорив» для промпту (може бути null).
-  async function maybeGemini(audioBlob, name, folderId, meta) {
+  // durationMs — тривалість запису (null при відновленні: точний кінець невідомий).
+  async function maybeGemini(audioBlob, name, folderId, meta, durationMs) {
     const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
-    if (!geminiApiKey) { MRLog.log('info', 'gemini', 'Конспект пропущено: не задано Gemini-ключ'); return true; }
+    if (!geminiApiKey) { MRLog.log('info', 'gemini', 'Транскрипт і конспект пропущено: не задано Gemini-ключ'); return true; }
     // Свідомо шлемо ЛИШЕ аудіо-доріжку. Повне відео сюди слати не можна: години 720p —
-    // це ГБ і не влазить у ліміт файлу/контекст, конспект гарантовано впаде або таймаутиться.
+    // це ГБ і не влазить у ліміт файлу/контекст, транскрипт гарантовано впаде або таймаутиться.
     if (!audioBlob || !audioBlob.size) {
-      MRLog.log('warn', 'gemini', 'Конспект пропущено: у записі немає аудіо-доріжки (старий запис або без звуку): ' + name);
-      setStatus('Конспект пропущено: у записі немає окремої аудіо-доріжки (старий запис або без звуку)');
+      MRLog.log('warn', 'gemini', 'Транскрипт пропущено: у записі немає аудіо-доріжки (старий запис або без звуку): ' + name);
+      setStatus('Транскрипт пропущено: у записі немає окремої аудіо-доріжки (старий запис або без звуку)');
       return true;
     }
     const baseName = name.replace(/\.webm$/i, '');
 
-    // Аудіо-доріжка в Drive — ПОСТІЙНЕ джерело конспекту: копія в Gemini живе ~48 год,
-    // і якщо конспект за цей час не вдасться, background сам перезаллє аудіо з Drive
-    // і доробить. Після успішного конспекту background це аудіо з Drive видаляє.
+    // Аудіо-доріжка в Drive — постійний файл теки зустрічі (відео, аудіо, транскрипт,
+    // конспект) і джерело транскрипту: копія в Gemini живе ~48 год, і якщо розшифровка
+    // за цей час не вдасться, background сам перезаллє аудіо з Drive і доробить.
     let audioDriveId = null;
     try {
-      setSaving(true, 'Зберігаю аудіо на Drive (страховка конспекту) — НЕ закривайте вкладку');
+      setSaving(true, 'Зберігаю аудіо на Drive — НЕ закривайте вкладку');
       const up = await withToken(async (token) => {
         const fId = folderId || await GDrive.getMeetingFolderId(token, baseName);
         return GDrive.uploadResumable(token, audioBlob, baseName + ' — аудіо.webm', { folderId: fId });
       });
       audioDriveId = up.fileId || null;
-      MRLog.log('info', 'save', 'Аудіо-доріжку збережено в Drive (джерело конспекту): ' + baseName);
+      MRLog.log('info', 'save', 'Аудіо-доріжку збережено в Drive: ' + baseName);
     } catch (e) {
-      MRLog.log('warn', 'save', 'Аудіо в Drive не збереглося — конспект піде без страховки: ' + ((e && e.message) || e));
+      MRLog.log('warn', 'save', 'Аудіо в Drive не збереглося — транскрипт піде без резервного джерела: ' + ((e && e.message) || e));
     }
 
     try {
-      setStatus('Готую конспект (надсилаю аудіо в Gemini)…');
-      setSaving(true, 'Надсилаю аудіо для конспекту — НЕ закривайте вкладку');
+      setStatus('Готую транскрипт (надсилаю аудіо в Gemini)…');
+      setSaving(true, 'Надсилаю аудіо для транскрипту — НЕ закривайте вкладку');
       const file = await Gemini.geminiUploadFile(audioBlob, geminiApiKey, 'audio/webm');
       const r = await sendBg({
         type: 'GEMINI_CONTINUE',
@@ -703,16 +707,16 @@
           geminiFileName: file.name,
           fileUri: file.uri,
           mimeType: file.mimeType,
-          docName: baseName + ' — конспект',
           meetingBaseName: baseName,
           folderId: folderId || null,
           speakerContext: meta || null,
-          audioDriveId
+          audioDriveId,
+          durationMs: durationMs || null
         }
       });
       if (!r || !r.ok) throw new Error((r && r.error) || 'background не прийняв завдання');
-      MRLog.log('info', 'gemini', 'Аудіо залито в Gemini, конспект робиться у фоні: ' + baseName);
-      setStatus('Конспект робиться у фоні — вкладку можна закрити.');
+      MRLog.log('info', 'gemini', 'Аудіо залито в Gemini, транскрипт і конспект робляться у фоні: ' + baseName);
+      setStatus('Транскрипт і конспект робляться у фоні — вкладку можна закрити.');
       return true;
     } catch (e) {
       MRLog.log('error', 'gemini', 'Не вдалося залити аудіо в Gemini: ' + ((e && e.message) || e));
@@ -840,7 +844,7 @@
       // Якщо її нема (стара сесія / запис без звуку) — maybeGemini чесно пропустить конспект.
       const audioBlob = await RecStore.readBlob(session.id, 'audio/webm', 'audio').catch(() => null);
       // Імена/шкала мовців збережені в сесії ще під час запису (тік раз на 30 с).
-      const gemOk = await maybeGemini(audioBlob, name, folderId, session.meta || null);
+      const gemOk = await maybeGemini(audioBlob, name, folderId, session.meta || null, null);
       if (gemOk) {
         await RecStore.deleteSession(session.id);
         initRecovery(); // якщо є ще незавершені сесії — одразу показати наступний банер

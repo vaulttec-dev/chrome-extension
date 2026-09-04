@@ -83,6 +83,14 @@
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || msg.target !== 'offscreen') return;
 
+    // Єдине джерело правди про «чи йде запис»: MediaRecorder живе тут, тож пережити
+    // перезапуск service worker чи перезавантаження розширення він не може. Все, що
+    // лежить у storage, — лише кеш для миттєвого малювання попапа.
+    if (msg.type === 'state') {
+      sendResponse({ ok: true, recording: !!(recorder && recorder.state === 'recording') });
+      return; // відповідь синхронна — порт тримати не треба
+    }
+
     if (msg.type === 'start') {
       start().then(sendResponse, (e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
       return true;

@@ -44,11 +44,18 @@ function refreshDict() {
     .then(({ dictPhase, dictLast }) => renderDict(dictPhase, dictLast));
 }
 
+// Перше малювання — з кешу (миттєво), а слідом питаємо background про СПРАВЖНІЙ стан:
+// він звіряє кеш із offscreen-документом і чинить розходження. Без цього застряглий
+// dictPhase='busy' назавжди лишав кнопку неактивною.
 refreshDict();
+chrome.runtime.sendMessage({ target: 'bg', type: 'DICT_STATE' })
+  .then((r) => { if (r && r.ok) renderDict(r.phase, r.last); })
+  .catch(() => { /* SW не відповів — лишається кеш, наступний клік усе одно синхронізує */ });
 
 dictBtn.addEventListener('click', () => {
-  // Оптимістично перемикаємо вигляд, щоб кнопка відгукнулась миттєво; справжній
-  // стан однаково прилетить зі storage — і зараз, і при наступному відкритті.
+  // Оптимістично перемикаємо вигляд, щоб кнопка відгукнулась миттєво. Напрямок
+  // (старт чи стоп) вирішує не цей клас, а background — за реальним станом offscreen;
+  // якщо ми вгадали не так, правильна фаза прилетить через storage.onChanged.
   const wasRecording = dictBtn.classList.contains('rec');
   renderDict(wasRecording ? 'busy' : 'recording', null);
   chrome.storage.local.get('geminiApiKey')
