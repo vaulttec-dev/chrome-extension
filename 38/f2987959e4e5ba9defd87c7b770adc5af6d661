@@ -1,0 +1,52 @@
+meet-recorder/gemini.js
+  s_697cc97183776c::t_1ba33b1c589d5d 262
+dictaphone/background.js
+  s_697cc97183776c::t_42f2ffbf3d0a40 4-6,8-10,12-13,16-24,28-42,48-77,92,94-98,100-104,106-110,112,114-119,121-126,128-129,131-134,136-140,142-150,164-167,169-172
+  s_697cc97183776c::t_39f0bc84ec98d0 1-3,7,11,14-15,25-27,43-47,78-91,93,99,105,111,113,120,127,130,135,141,151-163,168
+dictaphone/popup.html
+  s_697cc97183776c::t_1ee438800b4234 1-62
+dictaphone/mic.js
+  s_697cc97183776c::t_439a1a386a0ee6 8
+meet-recorder/popup.js
+  s_697cc97183776c::t_e9120cb36a3b1a 1
+dictaphone/offscreen.js
+  s_697cc97183776c::t_c20d69bdf4a472 87
+meet-recorder/manifest.json
+  s_697cc97183776c::t_1eb5c5740765c1 6
+dictaphone/manifest.json
+  s_697cc97183776c::t_90b15c5111f788 9
+  s_697cc97183776c::t_ecf020208e285d 1-8,10-21
+dictaphone/README.md
+  s_697cc97183776c::t_c608a054be49d7 25
+  s_697cc97183776c::t_bc2942ead8058e 22
+  s_697cc97183776c::t_1c8dfdc272a528 3-4
+  s_697cc97183776c::t_68eebce985ed72 11
+  s_697cc97183776c::t_df244ea3538a13 1-2,5-10,12-21,23-24,26
+dictaphone/popup.js
+  s_697cc97183776c::t_76d7486285a55d 1-79
+dictaphone/gemini.js
+  s_697cc97183776c::t_a1ac1a7b0f198d 1-140
+meet-recorder/background.js
+  s_697cc97183776c::t_dd2bd9cb564006 412-414
+meet-recorder/README.md
+  s_697cc97183776c::t_78e505e8e627fa 34
+  s_697cc97183776c::t_fe85491d46b6ca 19-21
+  s_697cc97183776c::t_257c43e924f094 38
+  s_697cc97183776c::t_d0fe539d936ebe 37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "38f2987959e4e5ba9defd87c7b770adc5af6d661",
+  "prompts": {},
+  "sessions": {
+    "s_697cc97183776c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e91d665-d595-4b1f-997d-9026f313df3f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
