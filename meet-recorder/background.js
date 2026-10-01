@@ -78,150 +78,6 @@ function download(url, filename) {
   });
 }
 
-// ---- Диктофон: offscreen (мікрофон + Gemini + буфер) ----
-// Документ створює SW (chrome.offscreen недоступний ні content script, ні попапу).
-// Джерело правди про «чи йде запис» — САМ offscreen (там живе MediaRecorder); storage —
-// лише кеш для миттєвого малювання попапа, і перед кожною дією їх звіряє syncDictState.
-// offscreen один на все розширення, тож другий getUserMedia неможливий, поки йде запис
-// (жодних «зомбі-мікрофонів»).
-let dictBusy = false; // серіалізуємо toggle, щоб клік+клавіша не наклалися
-let offscreenCreating = null;
-
-async function ensureOffscreen() {
-  const ctxs = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
-  if (ctxs.length) return;
-  if (!offscreenCreating) {
-    offscreenCreating = chrome.offscreen.createDocument({
-      url: 'offscreen.html',
-      reasons: ['USER_MEDIA', 'CLIPBOARD'],
-      justification: 'Запис мікрофона для голосової транскрипції та копіювання тексту в буфер.'
-    }).finally(() => { offscreenCreating = null; });
-  }
-  await offscreenCreating;
-}
-
-async function closeOffscreen() {
-  try {
-    const ctxs = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
-    if (ctxs.length) await chrome.offscreen.closeDocument();
-  } catch (_) { /* уже закритий */ }
-}
-
-// Стан диктофона для інтерфейсу (попап) — у storage, а не повідомленням у вкладки.
-// Кнопка живе в попапі, який Chrome знищує при кожному закритті, тож єдине надійне
-// джерело правди — storage: попап перемальовується з нього при відкритті й через
-// storage.onChanged, поки відкритий.
-//   phase: 'idle' | 'recording' | 'busy' (йде транскрипція)
-//   last:  підсумок останньої спроби — { ok, len } або { ok:false, error }
-function setDictUi(phase, last) {
-  const patch = { dictPhase: phase };
-  if (last !== undefined) patch.dictLast = last;
-  return chrome.storage.local.set(patch).catch(() => {});
-}
-
-// Справжній стан питаємо в offscreen: MediaRecorder живе ТІЛЬКИ там. Записи в storage
-// переживають і перезапуск service worker, і перезавантаження розширення, а сам запис —
-// ні, тож довіряти кешу не можна: саме через це кнопка залипала («offscreen не відповів»
-// на першому ж кліку або вічне «Розшифровую…» з неактивною кнопкою).
-async function readDictTruth() {
-  const ctxs = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
-  if (!ctxs.length) return false;
-  try {
-    const r = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'state' });
-    return !!(r && r.recording);
-  } catch (_) {
-    return false; // документ є, але скрипт ще/вже не слухає — записом це не вважаємо
-  }
-}
-
-// Звіряє кеш із реальністю й повертає фактичну фазу. Викликається і при відкритті
-// попапа, і перед кожним перемиканням — тож будь-яке залипання лікується самé.
-async function syncDictState() {
-  const recording = await readDictTruth();
-  const { dictRecording, dictPhase } = await chrome.storage.local.get(['dictRecording', 'dictPhase']);
-
-  if (recording) {
-    if (!dictRecording || dictPhase !== 'recording') {
-      await chrome.storage.local.set({ dictRecording: true });
-      await setDictUi('recording');
-    }
-    return 'recording';
-  }
-  // «busy» правдиве лише поки транскрипцію веде ЖИВИЙ service worker: dictBusy — змінна
-  // в пам'яті SW, тож після його перезапуску вона сама по собі false, і фаза розлипає.
-  if (dictBusy && dictPhase === 'busy') return 'busy';
-  if (dictRecording || dictPhase === 'recording' || dictPhase === 'busy') {
-    await chrome.storage.local.set({ dictRecording: false });
-    await setDictUi('idle', { ok: false, error: 'Попередній запис обірвався (розширення перезапустилось). Спробуйте ще раз.' });
-    MRLog.log('warn', 'dict', 'Скинуто застряглий стан диктофона: ' + (dictPhase || 'recording'));
-  }
-  return 'idle';
-}
-
-async function handleDictToggle(msg, sendResponse) {
-  if (dictBusy) { sendResponse({ ok: false, error: 'зачекайте — обробляю попередню дію' }); return; }
-  dictBusy = true;
-  try {
-    const recording = await readDictTruth();
-    if (!recording) {
-      // ---- СТАРТ ----
-      const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
-      if (!geminiApiKey) {
-        const error = 'Немає Gemini API-ключа — додайте його нижче в цьому вікні.';
-        await setDictUi('idle', { ok: false, error });
-        sendResponse({ ok: false, error });
-        return;
-      }
-      await ensureOffscreen();
-      const res = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'start' });
-      if (res && res.ok) {
-        await chrome.storage.local.set({ dictRecording: true });
-        await setDictUi('recording', null);
-        sendResponse({ ok: true, recording: true });
-      } else {
-        if (res && res.code === 'mic') chrome.tabs.create({ url: chrome.runtime.getURL('mic.html') });
-        await closeOffscreen();
-        const error = (res && res.error) || 'не вдалося почати запис';
-        await setDictUi('idle', {
-          ok: false,
-          error: res && res.code === 'mic'
-            ? 'Надайте доступ до мікрофона у вкладці, що відкрилась, і спробуйте знову.'
-            : error
-        });
-        sendResponse({ ok: false, code: res && res.code, error });
-      }
-    } else {
-      // ---- СТОП + транскрипція. Мікрофон звільняє САМ offscreen через track.stop()
-      // (як роблять Zed/VS Code). Документ НЕ закриваємо: закриття offscreen лишає
-      // застряглі privacy-іконки в COSMIC. Idle-документ без активного треку індикатора не дає.
-      await chrome.storage.local.set({ dictRecording: false });
-      await setDictUi('busy');
-      let res;
-      try { res = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'stop', key: msg.key }); }
-      catch (e) { res = { ok: false, error: e.message }; }
-      if (res && res.ok) {
-        const len = (res.text || '').length;
-        MRLog.log('info', 'dict', len ? ('Транскрипт скопійовано (' + len + ' симв.)') : 'Порожньо — мовлення не розпізнано');
-        await setDictUi('idle', { ok: true, len });
-        sendResponse({ ok: true, recording: false, text: res.text });
-      } else {
-        const error = (res && res.error) || 'offscreen не відповів';
-        MRLog.log('error', 'dict', error);
-        await setDictUi('idle', { ok: false, error });
-        sendResponse({ ok: false, recording: false, error });
-      }
-    }
-  } catch (e) {
-    // Offscreen НЕ закриваємо: постійний потік мікрофона = одна стабільна трей-іконка
-    // (часті open/close засмічують трей COSMIC мертвими записами).
-    await chrome.storage.local.set({ dictRecording: false }).catch(() => {});
-    await setDictUi('idle', { ok: false, error: e.message });
-    sendResponse({ ok: false, error: e.message });
-  } finally {
-    dictBusy = false;
-  }
-}
-
 // ---- Повідомлення ----
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -256,18 +112,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         try { sendResponse({ ok: true, token: await getToken(true) }); }
         catch (e) { sendResponse({ ok: false, error: e.message }); }
       })();
-      return true;
-
-    case 'DICT_TOGGLE':
-      handleDictToggle(msg, sendResponse);
-      return true;
-
-    // Попап питає при кожному відкритті: заразом звіряємо кеш із реальністю,
-    // тож застряглий стан («вічне Розшифровую…») розсмоктується сам.
-    case 'DICT_STATE':
-      syncDictState()
-        .then((phase) => chrome.storage.local.get('dictLast').then(({ dictLast }) => sendResponse({ ok: true, phase, last: dictLast })))
-        .catch((e) => sendResponse({ ok: false, phase: 'idle', error: e.message }));
       return true;
 
     case 'GEMINI_CONTINUE':
@@ -559,23 +403,12 @@ function meetingFolderName(topic, baseName) {
 // кожному старті SW; onStartup-слухач гарантує, що SW прокинеться на старті браузера.
 chrome.runtime.onStartup.addListener(() => { /* будить SW; переозброєння робить код нижче */ });
 
-// Скидання стану диктофона — ЛИШЕ на старті браузера та оновленні розширення.
-// НЕ в top-level: SW прокидається щопівхвилини (тики конспекту, повідомлення), і
-// top-level closeOffscreen убивав би offscreen прямо посеред запису диктофона.
-function resetDictation() {
-  // Скидаємо і dictPhase: попап малює кнопку саме з нього, і застрягле 'busy'
-  // (SW помер посеред транскрипції) залишало кнопку назавжди неактивною.
-  chrome.storage.local.set({ dictRecording: false, dictPhase: 'idle' });
-  closeOffscreen();
-}
-chrome.runtime.onStartup.addListener(resetDictation);
-chrome.runtime.onInstalled.addListener(resetDictation);
-
 chrome.storage.local.get('geminiJobs').then(({ geminiJobs }) => {
   if (Array.isArray(geminiJobs) && geminiJobs.length) {
     chrome.alarms.create(GEMINI_ALARM, { periodInMinutes: 0.5 });
   }
 });
 
-// Прибирання ключів, що лишилися від старих версій (redo-кнопка, legacy-джоб, tabId).
-chrome.storage.local.remove(['lastGeminiJob', 'geminiJob', 'recordingTabId']);
+// Прибирання ключів, що лишилися від старих версій (redo-кнопка, legacy-джоб, tabId,
+// диктофон — тепер окреме розширення).
+chrome.storage.local.remove(['lastGeminiJob', 'geminiJob', 'recordingTabId', 'dictRecording', 'dictPhase', 'dictLast']);

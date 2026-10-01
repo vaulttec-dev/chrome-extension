@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Диктофон → буфер",
+  "version": "1.0.0",
+  "description": "Гаряча клавіша: запис із мікрофона, ще раз — транскрипт через Gemini у буфер обміну.",
+  "permissions": ["storage", "offscreen", "clipboardWrite", "notifications"],
+  "host_permissions": ["https://generativelanguage.googleapis.com/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "Диктофон → буфер (Alt+Shift+D)" },
+  "commands": {
+    "toggle-dictation": {
+      "suggested_key": { "default": "Alt+Shift+D" },
+      "description": "Почати / зупинити диктування (транскрипт — у буфер)"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

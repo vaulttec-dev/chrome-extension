@@ -84,8 +84,7 @@
     if (!msg || msg.target !== 'offscreen') return;
 
     // Єдине джерело правди про «чи йде запис»: MediaRecorder живе тут, тож пережити
-    // перезапуск service worker чи перезавантаження розширення він не може. Все, що
-    // лежить у storage, — лише кеш для миттєвого малювання попапа.
+    // перезапуск service worker чи перезавантаження розширення він не може.
     if (msg.type === 'state') {
       sendResponse({ ok: true, recording: !!(recorder && recorder.state === 'recording') });
       return; // відповідь синхронна — порт тримати не треба
@@ -97,7 +96,6 @@
     }
 
     if (msg.type === 'stop') {
-      // Відповідаємо; закриває документ (звільняє мікрофон) service worker після цієї відповіді.
       stop(msg.key).then(sendResponse, (e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
       return true;
     }

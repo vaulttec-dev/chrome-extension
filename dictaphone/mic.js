@@ -5,7 +5,7 @@
   navigator.mediaDevices.getUserMedia({ audio: true })
     .then((stream) => {
       stream.getTracks().forEach((t) => t.stop());
-      el.textContent = '✓ Дозвіл надано. Можете закрити цю вкладку й натиснути 🎤 у вікні розширення.';
+      el.textContent = '✓ Дозвіл надано. Можете закрити цю вкладку й натиснути гарячу клавішу диктофона ще раз.';
       el.className = 'ok';
     })
     .catch((e) => {

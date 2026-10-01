@@ -257,29 +257,8 @@
     return { text, model: GEMINI_MODEL, finishReason };
   }
 
-  // ---- Диктофон: короткий аудіоблоб → текст ----
-  // Той самий шлях, що й у зустрічі: resumable-аплоад у Files API → коротке очікування
-  // ACTIVE → geminiTranscribeFile (спеціалізована модель із запасним шляхом).
-  // onWait — необовʼязковий колбек статусу (напр., щоб оновити тост «обробка…»).
-  async function geminiTranscribe(blob, key, onWait) {
-    const mime = (blob.type || 'audio/webm').split(';')[0];
-    let file = await geminiUploadFile(blob, key, mime);
-
-    // Аудіо зазвичай стає ACTIVE майже одразу; чекаємо максимум ~30 с.
-    for (let i = 0; i < 30 && file.state === 'PROCESSING'; i++) {
-      if (onWait) onWait(i);
-      await new Promise((res) => setTimeout(res, 1000));
-      file = await geminiGetFile(file.name, key);
-    }
-    if (file.state === 'FAILED') throw new Error('Gemini не зміг обробити аудіо');
-    if (file.state === 'PROCESSING') throw new Error('Gemini надто довго обробляє аудіо');
-
-    const { text } = await geminiTranscribeFile(file.uri, file.mimeType || mime, key, null);
-    return text;
-  }
-
   g.Gemini = {
     GEMINI_MODEL, GEMINI_TRANSCRIBE_MODEL, GEMINI_PROMPT, splitTopic,
-    geminiUploadFile, geminiGetFile, geminiTranscribeFile, geminiSummarize, geminiTranscribe
+    geminiUploadFile, geminiGetFile, geminiTranscribeFile, geminiSummarize
   };
 })(globalThis);

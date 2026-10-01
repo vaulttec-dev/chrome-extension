@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        font-family: "Google Sans", Roboto, system-ui, sans-serif;
+        width: 300px;
+        margin: 0;
+        padding: 14px;
+        color: #202124;
+      }
+      h1 { font-size: 14px; margin: 0 0 10px; }
+      button {
+        width: 100%;
+        padding: 9px;
+        border: 0;
+        border-radius: 6px;
+        font-size: 14px;
+        cursor: pointer;
+        background: #1a73e8;
+        color: #fff;
+      }
+      #dict { font-weight: 500; }
+      #dict.rec { background: #d93025; animation: dictpulse 1.4s ease-in-out infinite; }
+      #dict.busy { background: #5f6368; cursor: default; }
+      @keyframes dictpulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(217, 48, 37, 0.45); }
+        60%      { box-shadow: 0 0 0 7px rgba(217, 48, 37, 0); }
+      }
+      .hint { font-size: 12px; color: #80868b; margin: 10px 0 0; }
+      .hint.err { color: #c5221f; }
+      .hint a { color: #1a73e8; cursor: pointer; }
+      kbd { font: 11px "Roboto Mono", ui-monospace, monospace; background: #f1f3f4; border: 1px solid #dadce0; border-radius: 4px; padding: 0 5px; }
+      hr { border: 0; border-top: 1px solid #eceff1; margin: 14px 0 10px; }
+      .ghdr { display: block; font-size: 13px; font-weight: 500; margin: 0 0 6px; }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px;
+        border: 1px solid #dadce0;
+        border-radius: 6px;
+        font-size: 13px;
+        margin: 0 0 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Диктофон → буфер</h1>
+    <button id="dict">🎤 Почати диктування</button>
+    <p id="dictstate" class="hint"></p>
+    <p class="hint">Гаряча клавіша: <kbd id="shortcut">—</kbd> · <a id="shortcuts">змінити</a></p>
+
+    <hr />
+    <label class="ghdr" for="gkey">Gemini API-ключ</label>
+    <input id="gkey" type="password" placeholder="Вставте ключ і натисніть «Зберегти»" autocomplete="off" />
+    <button id="savekey">Зберегти ключ</button>
+    <p id="keystate" class="hint"></p>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

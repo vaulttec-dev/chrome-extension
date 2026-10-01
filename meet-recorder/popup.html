@@ -26,14 +26,6 @@
         cursor: pointer;
       }
       #savekey { background: #1a73e8; color: #fff; }
-      #dict { background: #1a73e8; color: #fff; font-weight: 500; }
-      #dict.rec { background: #d93025; animation: dictpulse 1.4s ease-in-out infinite; }
-      #dict.busy { background: #5f6368; cursor: default; }
-      @keyframes dictpulse {
-        0%, 100% { box-shadow: 0 0 0 0 rgba(217, 48, 37, 0.45); }
-        60%      { box-shadow: 0 0 0 7px rgba(217, 48, 37, 0); }
-      }
-      #dictstate.err { color: #c5221f; }
       .hint { font-size: 12px; color: #80868b; margin: 10px 0 0; }
       hr { border: 0; border-top: 1px solid #eceff1; margin: 14px 0 10px; }
       .ghdr { display: block; font-size: 13px; font-weight: 500; margin: 0 0 6px; }
@@ -48,41 +40,11 @@
         background: #fff;
         color: inherit;
       }
-      .loghdr { display: flex; align-items: center; justify-content: space-between; margin: 0 0 6px; }
-      .loghdr .ghdr { margin: 0; }
-      #clearlog {
-        width: auto; padding: 3px 8px; font-size: 11px;
-        background: #f1f3f4; color: #5f6368; border-radius: 4px;
-      }
-      #log {
-        max-height: 420px; overflow-y: auto;
-        border: 1px solid #eceff1; border-radius: 6px;
-        padding: 6px; font-size: 11px; line-height: 1.45;
-        background: #fafafa;
-        font-family: "Roboto Mono", ui-monospace, monospace;
-      }
-      #log .empty { color: #9aa0a6; }
-      #log .row { padding: 2px 0; border-bottom: 1px solid #f1f3f4; white-space: normal; word-break: break-word; }
-      #log .row:last-child { border-bottom: 0; }
-      #log .t { color: #9aa0a6; }
-      #log .day {
-        position: sticky; top: -6px;
-        margin: 4px -6px; padding: 3px 6px;
-        background: #eef3fc; color: #1a56ab;
-        font-weight: 600; font-size: 11px;
-      }
-      #log .row.warn { color: #b06000; }
-      #log .row.error { color: #c5221f; }
     </style>
   </head>
   <body>
     <h1>Запис Meet → Drive</h1>
     <p id="status">—</p>
-
-    <hr />
-    <span class="ghdr">Диктофон → транскрипт у буфер</span>
-    <button id="dict">🎤 Почати диктування</button>
-    <p id="dictstate" class="hint"></p>
 
     <hr />
     <label class="ghdr" for="quality">Якість відео</label>
@@ -99,13 +61,6 @@
     <input id="gkey" type="password" placeholder="Вставте ключ і натисніть «Зберегти»" autocomplete="off" />
     <button id="savekey">Зберегти ключ</button>
     <p id="keystate" class="hint"></p>
-
-    <hr />
-    <div class="loghdr">
-      <span class="ghdr">Логи</span>
-      <button id="clearlog">Очистити</button>
-    </div>
-    <div id="log"><span class="empty">Поки що порожньо.</span></div>
 
     <script src="popup.js"></script>
   </body>

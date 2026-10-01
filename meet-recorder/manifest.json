@@ -3,7 +3,7 @@
   "name": "Запис Meet → Drive",
   "version": "1.0.0",
   "description": "Запис дзвінка Google Meet однією кнопкою з автозавантаженням у Google Drive.",
-  "permissions": ["identity", "storage", "downloads", "alarms", "notifications", "offscreen", "clipboardWrite"],
+  "permissions": ["identity", "storage", "downloads", "alarms", "notifications"],
   "host_permissions": [
     "https://www.googleapis.com/*",
     "https://generativelanguage.googleapis.com/*"

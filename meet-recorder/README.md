@@ -16,6 +16,9 @@
 
 Працює на безкоштовному `@gmail.com`. Записує навіть чужі дзвінки, де ви не організатор.
 
+Диктофон (мікрофон → транскрипт у буфер за гарячою клавішею) — окреме розширення в
+`../dictaphone/`.
+
 ---
 
 ## Як це влаштовано
@@ -28,13 +31,11 @@ content script'у OAuth-токен (бо `chrome.identity` доступний л
 
 | Файл | Роль |
 |------|------|
-| `manifest.json` | Дозволи (`identity`, `storage`, `downloads`, `alarms`, `offscreen`, `clipboardWrite`), OAuth, реєстрація скриптів. |
+| `manifest.json` | Дозволи (`identity`, `storage`, `downloads`, `alarms`, `notifications`), OAuth, реєстрація скриптів. |
 | `content.js` / `content.css` | Кнопка в Meet, детекція дзвінка, захоплення (`getDisplayMedia` + мікрофон), `MediaRecorder`, аплоад відео й аудіо-доріжки на Drive (або локально) і заливання аудіо в Gemini. |
 | `gdrive.js` / `gemini.js` | Чисті функції Drive / Gemini (приймають токен/ключ) — спільні для content script і service worker, без дублювання. |
-| `background.js` | OAuth-токен для content script, фоновий конспект через `chrome.alarms` (Files API → `generateContent` → Google Doc / `.txt`) з ретраями до дедлайну та перезаливкою аудіо з Drive; стан диктофона. |
-| `popup.html` / `popup.js` | Статус, кнопка диктофона 🎤 (запис → транскрипт у буфер), якість відео, Gemini-ключ, повноцінні логи. |
-| `offscreen.html` / `offscreen.js` | Невидимий документ розширення: тримає мікрофон диктофона, транскрибує через Gemini, копіює текст у буфер. |
-| `mic.html` / `mic.js` | Одноразовий запит дозволу мікрофона для диктофона. |
+| `background.js` | OAuth-токен для content script, фоновий конспект через `chrome.alarms` (Files API → `generateContent` → Google Doc / `.txt`) з ретраями до дедлайну та перезаливкою аудіо з Drive. |
+| `popup.html` / `popup.js` | Статус, якість відео, Gemini-ключ. Журнал (`logstore.js`) пишеться в `chrome.storage.local.logs` і в консоль. |
 | `icons/` | Іконки (червона крапка). |
 
 Потік конспекту: клік «● Запис» → `getDisplayMedia({preferCurrentTab})` + `getUserMedia` (мікрофон) →
