@@ -4,7 +4,8 @@
 // журнал шматків на диск — у recstore.js (підключені перед цим файлом). OAuth-токен
 // бере service worker (chrome.identity недоступний у content script) і віддає рядком.
 (() => {
-  const MEET_CODE_RE = /^\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:$|[/?])/;
+  // Meet віддає код і як /abc-defg-hij, і як /meet/abc-defg-hij.
+  const MEET_CODE_RE = /^\/(?:meet\/)?([a-z]{3}-[a-z]{4}-[a-z]{3})(?:$|[/?])/;
 
   let btn = null;
   let isRecording = false;
